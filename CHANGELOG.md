@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-preview.11
+
+### Español
+
+- Añade captura del botón de autorecolección desde la configuración: selecciona un puerto XInput o cualquiera, pulsa «Capturar» y luego A, B, X o Y en el mando.
+- La captura solo cambia la selección pendiente; no activa acciones del juego y requiere «Guardar y aplicar» para persistirla. Si no detecta un botón en 15 segundos, permite reintentar.
+
+### English
+
+- Adds in-settings capture for the auto-gather button: choose an XInput slot or any controller, press “Capture,” then press A, B, X, or Y on the controller.
+- Capture only changes the pending selection; it does not trigger game actions and requires “Save and Apply” to persist. If no button is detected within 15 seconds, it can be retried.
+
 ## 0.1.0-preview.10
 
 ### Español

@@ -35,6 +35,7 @@ La aplicación incluye una ventana de estado para comprobar si el juego está en
 - Copia un diagnóstico técnico al portapapeles sin incluir rutas personales. La versión también aparece en las propiedades del ejecutable.
 - Permite silenciar los avisos de conexión del mando sin ocultar su estado en la ventana. La interfaz escala con el DPI de Windows.
 - La ventana confirma en vivo si detecta el botón de recolección configurado y si los pulsos están activos; el diagnóstico copia también el puerto XInput que lo está enviando.
+- La configuración puede capturar A, B, X o Y directamente desde el mando, limitada al puerto seleccionado o a cualquiera de los conectados.
 - Permite añadir botones, direcciones de la cruceta y gatillos XInput a las guardas que descartan el scroll durante acciones.
 - El aviso del mando respeta el botón de autorecolección elegido. El icono de bandeja permite abrir la ventana con un clic y ofrece un menú con configuración, rueda y cierre.
 
@@ -86,6 +87,8 @@ En `[Input]`, `extra_guard_keys` añade hasta ocho teclas que bloquean la rueda 
 Pulsa **Copiar diagnóstico** en la ventana principal (o desde el menú del icono de bandeja) para copiar versión, foco del juego, estado XInput, ajustes activos y errores de cola. No copia tu nombre de usuario ni la ruta completa del INI.
 Los mensajes de estado se guardan en `%LOCALAPPDATA%\MH3WorldControls\MH3WorldControls.log` y se rotan al superar 512 KB.
 
+En la ventana, elige el puerto, pulsa **Capturar** y luego A, B, X o Y en el mando. La captura dura hasta 15 segundos y solo se aplica al pulsar **Guardar y aplicar**.
+
 ### Solución de problemas
 
 - **La rueda no cambia objetos:** confirma que el helper está abierto y que OceanTriRecomp tiene el foco. Revisa que otra aplicación no esté capturando la rueda.
@@ -127,6 +130,7 @@ The app includes a status window to check game focus and XInput detection, pause
 - Use guarded, short selection pulses to reduce accidental item use.
 - Repeat gathering while holding F or the logical Confirm button: **Xbox B / PlayStation Circle**.
 - Configure the XInput gather button, choose which controller port can trigger it, or turn auto-gather off.
+- Capture A, B, X, or Y directly from a controller in Settings, scoped to the selected XInput slot or any connected controller.
 - F8 toggles wheel capture; F9 exits the helper.
 - Shows a Windows notification when an XInput controller connects or disconnects.
 - Provides a settings window for wheel and auto-gather timing, with immediate apply.
@@ -149,6 +153,8 @@ The active configuration is `%LOCALAPPDATA%\MH3WorldControls\MH3WorldControls.in
 You can also open the settings window from the main window. Use the arrow controls to adjust values or choose a **Suave**, **Equilibrado**, or **Ágil** wheel preset. Choose **Guardar y aplicar** to save the settings together and use them immediately. Manual INI edits require a helper restart.
 
 In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping. Set `gather_controller` to `any` or an XInput port from `0` to `3`; set `connection_notifications=0` to mute Windows notices while keeping the status panel active. In `[Wheel]`, `sensitivity_percent` adjusts scroll sensitivity from 50% to 200%, and `invert=1` reverses direction. In `[Input]`, `extra_guard_keys` accepts up to eight comma-separated keys such as `X, E, F`; `extra_guard_buttons` accepts up to sixteen XInput controls such as `LT, LB, DPAD_UP`. Trigger guards activate at 32/255. These additions preserve the built-in safety guards.
+
+In Settings, choose the controller slot, press **Capturar**, then press A, B, X, or Y on the controller. Capture waits up to 15 seconds and applies only after **Guardar y aplicar**.
 
 Use **Copiar diagnóstico** in the main window or tray menu to copy version, game-focus, controller, timing and queue status. The report excludes your Windows username and full configuration path.
 Status messages are kept in `%LOCALAPPDATA%\MH3WorldControls\MH3WorldControls.log`, rotated above 512 KB.

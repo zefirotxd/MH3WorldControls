@@ -53,13 +53,15 @@ constexpr int kSettingsWheelInvert = 2015;
 constexpr int kSettingsWheelSensitivity = 2016;
 constexpr int kSettingsControllerNotifications = 2017;
 constexpr int kSettingsExtraGuardButtons = 2018;
+constexpr int kSettingsCaptureGatherButton = 2019;
+constexpr UINT_PTR kSettingsCaptureTimer = 2;
 constexpr int kTrayShow = 3001;
 constexpr int kTraySettings = 3002;
 constexpr int kTrayToggleWheel = 3003;
 constexpr int kTrayExit = 3004;
 constexpr int kTrayCopyDiagnostics = 3005;
 constexpr int kCopyDiagnosticsButton = 1004;
-constexpr wchar_t kAppVersion[] = L"0.1.0-preview.10";
+constexpr wchar_t kAppVersion[] = L"0.1.0-preview.11";
 constexpr int kMainLogicalWidth = 720;
 constexpr int kMainLogicalHeight = 540;
 constexpr int kSettingsLogicalWidth = 520;
@@ -74,6 +76,10 @@ std::atomic<bool> g_controllerNotificationsEnabled{true};
 std::atomic<WORD> g_extraControllerGuardButtons{0};
 std::atomic<bool> g_extraGuardLeftTrigger{false};
 std::atomic<bool> g_extraGuardRightTrigger{false};
+std::array<std::atomic<WORD>, XUSER_MAX_COUNT> g_xinputButtons{};
+std::atomic<bool> g_gatherButtonCaptureActive{false};
+std::array<WORD, XUSER_MAX_COUNT> g_capturePreviousButtons{};
+ULONGLONG g_gatherButtonCaptureDeadline = 0;
 std::array<std::atomic<int>, kMaxExtraGuardKeys> g_extraGuardKeys{};
 std::atomic<DWORD> g_extraGuardKeyCount{0};
 
@@ -248,7 +254,8 @@ BOOL CALLBACK ApplyFontToChild(HWND child, LPARAM) {
     const int id = GetDlgCtrlID(child);
     const bool bold = id == kToggleWheelButton || id == kOpenConfigButton ||
                       id == kCopyDiagnosticsButton || id == kExitButton ||
-                      id == kSettingsSave || id == kSettingsDefaults || id == kSettingsCancel;
+                      id == kSettingsSave || id == kSettingsDefaults || id == kSettingsCancel ||
+                      id == kSettingsCaptureGatherButton;
     SendMessageW(child, WM_SETFONT,
                  reinterpret_cast<WPARAM>(bold ? g_uiBoldFont : g_uiFont), TRUE);
     return TRUE;
@@ -860,14 +867,18 @@ XInputHeldActions ReadXInputHeldActions() {
         g_connectedControllerCount.store(0, std::memory_order_release);
         g_connectedControllerMask.store(0, std::memory_order_release);
         g_gatherButtonHeldMask.store(0, std::memory_order_release);
+        for (auto& buttons : g_xinputButtons)
+            buttons.store(0, std::memory_order_release);
         return held;
     }
 
     std::lock_guard<std::mutex> lock(g_xinputStateMutex);
     const auto now = Clock::now();
-    const bool discoverControllers = now >= g_nextXinputDiscovery;
+    const bool captureButton = g_gatherButtonCaptureActive.load(std::memory_order_acquire);
+    const bool discoverControllers = captureButton || now >= g_nextXinputDiscovery;
     if (discoverControllers)
-        g_nextXinputDiscovery = now + std::chrono::seconds(2);
+        g_nextXinputDiscovery = now + (captureButton ? std::chrono::milliseconds(100)
+                                                     : std::chrono::seconds(2));
 
     constexpr WORD kCombatButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B |
                                    XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y |
@@ -889,11 +900,13 @@ XInputHeldActions ReadXInputHeldActions() {
         XINPUT_STATE state{};
         if (g_xinputGetState(userIndex, &state) != ERROR_SUCCESS) {
             g_xinputConnected[userIndex] = false;
+            g_xinputButtons[userIndex].store(0, std::memory_order_release);
             continue;
         }
         g_xinputConnected[userIndex] = true;
 
         const auto& pad = state.Gamepad;
+        g_xinputButtons[userIndex].store(pad.wButtons, std::memory_order_release);
         const bool rightShoulderHeld = (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
         const bool moving = std::abs(int(pad.sThumbLX)) >= 12000 ||
                             std::abs(int(pad.sThumbLY)) >= 12000;
@@ -1225,15 +1238,18 @@ void PickupWorker() {
         const auto now = Clock::now();
         const WheelTiming timing = GetWheelTiming();
         const bool gameFocused = IsGameForeground();
+        const bool captureGatherButton =
+            g_gatherButtonCaptureActive.load(std::memory_order_acquire);
         XInputHeldActions xinput{};
-        if (gameFocused || now >= nextIdleControllerPoll) {
+        if (gameFocused || captureGatherButton || now >= nextIdleControllerPoll) {
             xinput = ReadXInputHeldActions();
-            nextIdleControllerPoll = now + (gameFocused ? std::chrono::milliseconds(5)
-                                                        : std::chrono::milliseconds(250));
+            nextIdleControllerPoll = now + (gameFocused ? std::chrono::milliseconds(5) :
+                captureGatherButton ? std::chrono::milliseconds(10) :
+                                      std::chrono::milliseconds(250));
         }
         g_controllerActionHeld.store(gameFocused && xinput.gameplayAction,
                                      std::memory_order_release);
-        const bool pickupHeld = gameFocused &&
+        const bool pickupHeld = gameFocused && !captureGatherButton &&
                                 (g_pickupHeld.load(std::memory_order_acquire) ||
                                  xinput.pickupButton);
 
@@ -2277,6 +2293,75 @@ void SaveSettings(HWND window) {
     DestroyWindow(window);
 }
 
+void StopGatherButtonCapture(HWND window, const wchar_t* buttonLabel = L"Capturar") {
+    g_gatherButtonCaptureActive.store(false, std::memory_order_release);
+    g_gatherButtonCaptureDeadline = 0;
+    if (window != nullptr) {
+        HWND captureButton = GetDlgItem(window, kSettingsCaptureGatherButton);
+        if (captureButton != nullptr)
+            SetWindowTextW(captureButton, buttonLabel);
+    }
+}
+
+void BeginGatherButtonCapture(HWND window) {
+    if (g_xinputGetState == nullptr) {
+        MessageBoxW(window,
+            L"No se encontró XInput. Conecta el mando mediante XInput o activa la emulación Xbox y vuelve a intentarlo.",
+            L"Capturar botón", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_xinputStateMutex);
+        for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
+            XINPUT_STATE state{};
+            g_capturePreviousButtons[slot] =
+                g_xinputGetState(slot, &state) == ERROR_SUCCESS ? state.Gamepad.wButtons : 0;
+            g_xinputButtons[slot].store(g_capturePreviousButtons[slot], std::memory_order_release);
+        }
+    }
+
+    g_gatherButtonCaptureDeadline = GetTickCount64() + 15000;
+    g_gatherButtonCaptureActive.store(true, std::memory_order_release);
+    SetWindowTextW(GetDlgItem(window, kSettingsCaptureGatherButton), L"Pulsa...");
+    SetFocus(GetDlgItem(window, kSettingsCaptureGatherButton));
+}
+
+void PollGatherButtonCapture(HWND window) {
+    if (!g_gatherButtonCaptureActive.load(std::memory_order_acquire))
+        return;
+
+    if (GetTickCount64() >= g_gatherButtonCaptureDeadline) {
+        StopGatherButtonCapture(window, L"Reintentar");
+        return;
+    }
+
+    const LRESULT selection = SendDlgItemMessageW(
+        window, kSettingsGatherController, CB_GETCURSEL, 0, 0);
+    const int selectedSlot = selection <= 0 || selection == CB_ERR
+                                 ? -1 : static_cast<int>(selection - 1);
+    constexpr WORD kFaceButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B |
+                                  XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y;
+    WORD newlyPressedFaceButtons = 0;
+    for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
+        const WORD current = g_xinputButtons[slot].load(std::memory_order_acquire);
+        if (selectedSlot < 0 || selectedSlot == static_cast<int>(slot))
+            newlyPressedFaceButtons |= static_cast<WORD>(
+                (current & ~g_capturePreviousButtons[slot]) & kFaceButtons);
+        g_capturePreviousButtons[slot] = current;
+    }
+
+    if (newlyPressedFaceButtons == 0 ||
+        (newlyPressedFaceButtons & (newlyPressedFaceButtons - 1)) != 0)
+        return;
+
+    const int buttonSelection = newlyPressedFaceButtons == XINPUT_GAMEPAD_B ? 0 :
+                                newlyPressedFaceButtons == XINPUT_GAMEPAD_A ? 1 :
+                                newlyPressedFaceButtons == XINPUT_GAMEPAD_X ? 2 : 3;
+    SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, buttonSelection, 0);
+    StopGatherButtonCapture(window, L"Capturar");
+}
+
 void DrawSettingsWindow(HDC dc, const RECT& client) {
     HBRUSH background = CreateSolidBrush(kUiBackground);
     FillRect(dc, &client, background);
@@ -2312,7 +2397,7 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         CreateSettingsLabel(window, L"Preapertura de la rueda (0–119)", 243);
         CreateSettingsLabel(window, L"Sensibilidad (50–200 %)", 274);
         CreateSettingsLabel(window, L"Teclas extra para bloquear", 306, 42, 170);
-        CreateSettingsLabel(window, L"Botón de recolección", 419);
+        CreateSettingsLabel(window, L"Botón de recolección", 419, 42, 240);
         CreateSettingsLabel(window, L"Mando permitido", 450);
         CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 481);
         CreateSettingsLabel(window, L"Intervalo entre intentos (200–1000 ms)", 512);
@@ -2342,7 +2427,7 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         HWND gatherCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-            ScaleUi(356), ScaleUi(418), ScaleUi(112), ScaleUi(150), window,
+            ScaleUi(290), ScaleUi(418), ScaleUi(112), ScaleUi(150), window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsGatherButton)), nullptr, nullptr);
         if (gatherCombo != nullptr) {
             const wchar_t* buttons[] = {L"B / Círculo", L"A", L"X", L"Y", L"Desactivar"};
@@ -2350,6 +2435,11 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
                 SendMessageW(gatherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(button));
             SendMessageW(gatherCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
         }
+        HWND captureGatherButton = CreateWindowExW(0, L"BUTTON", L"Capturar",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(408), ScaleUi(418), ScaleUi(72), ScaleUi(28), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCaptureGatherButton)),
+            nullptr, nullptr);
 
         HWND controllerCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -2400,16 +2490,19 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
             ScaleUi(352), ScaleUi(626), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), nullptr, nullptr);
         if (std::any_of(std::begin(controls), std::end(controls), [](HWND control) { return control == nullptr; }) ||
-            wheelPresetCombo == nullptr || gatherCombo == nullptr || controllerCombo == nullptr ||
+            wheelPresetCombo == nullptr || gatherCombo == nullptr ||
+            captureGatherButton == nullptr || controllerCombo == nullptr ||
             extraGuardEdit == nullptr || extraGuardButtonsEdit == nullptr ||
             extraGuardButtonsHint == nullptr || invertCheck == nullptr || notificationsCheck == nullptr ||
             defaults == nullptr ||
             save == nullptr || cancel == nullptr)
             return -1;
 
-        for (HWND control : {defaults, save, cancel})
+        for (HWND control : {defaults, save, cancel, captureGatherButton})
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiBoldFont), TRUE);
         PopulateSettings(window);
+        if (SetTimer(window, kSettingsCaptureTimer, 16, nullptr) == 0)
+            return -1;
         return 0;
     }
     case WM_ERASEBKGND:
@@ -2480,17 +2573,33 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         DeleteObject(pen);
         return TRUE;
     }
+    case WM_TIMER:
+        if (wParam == kSettingsCaptureTimer)
+            PollGatherButtonCapture(window);
+        return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case kSettingsSave:
+            StopGatherButtonCapture(window);
             SaveSettings(window);
             return 0;
         case kSettingsDefaults:
+            StopGatherButtonCapture(window);
             SetSettingsDefaults(window);
             return 0;
         case kSettingsCancel:
+            StopGatherButtonCapture(window);
             DestroyWindow(window);
             return 0;
+        case kSettingsCaptureGatherButton:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                if (g_gatherButtonCaptureActive.load(std::memory_order_acquire))
+                    StopGatherButtonCapture(window);
+                else
+                    BeginGatherButtonCapture(window);
+                return 0;
+            }
+            break;
         }
         if (LOWORD(wParam) == kSettingsWheelPreset && HIWORD(wParam) == CBN_SELCHANGE) {
             const LRESULT preset = SendDlgItemMessageW(window, kSettingsWheelPreset, CB_GETCURSEL, 0, 0);
@@ -2510,9 +2619,12 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         break;
     case WM_CLOSE:
+        StopGatherButtonCapture(window);
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        StopGatherButtonCapture(window);
+        KillTimer(window, kSettingsCaptureTimer);
         if (g_settingsEditBrush != nullptr) {
             DeleteObject(g_settingsEditBrush);
             g_settingsEditBrush = nullptr;
