@@ -1,0 +1,19 @@
+# CMake and Visual Studio
+/build/
+/out/
+/.vs/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake-build-*/
+/package/
+
+# Compiler outputs
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.lib
+*.exp
+
+# Packaged release artifacts
+*.zip

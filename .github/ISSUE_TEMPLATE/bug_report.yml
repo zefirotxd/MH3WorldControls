@@ -1,0 +1,50 @@
+name: Report a bug
+description: Report a reproducible problem with the helper.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: input
+    id: helper-version
+    attributes:
+      label: Helper version
+      placeholder: "0.1.0 / Plus10"
+    validations:
+      required: true
+  - type: input
+    id: game-version
+    attributes:
+      label: OceanTriRecomp version
+    validations:
+      required: true
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: dropdown
+    id: input-device
+    attributes:
+      label: Input device
+      options:
+        - Keyboard and mouse
+        - Xbox/XInput controller
+        - PlayStation controller through Steam Input or DS4Windows
+        - Other controller
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: List the exact actions and what you expected versus what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Helper console output
+      description: Paste relevant output. Do not include personal files or game data.
+    validations:
+      required: false

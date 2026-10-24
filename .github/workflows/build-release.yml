@@ -1,0 +1,48 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure x64 Release
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Compile
+        run: cmake --build build --config Release --parallel
+
+      - name: Package helper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item build/Release/MH3WorldControls.exe package/
+          Copy-Item MH3WorldControls.ini package/
+          Copy-Item README.md package/
+          Copy-Item LICENSE package/
+          Compress-Archive -Path package/* -DestinationPath MH3WorldControls-Windows-x64.zip -Force
+
+      - name: Upload build package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MH3WorldControls-Windows-x64
+          path: MH3WorldControls-Windows-x64.zip
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MH3WorldControls-Windows-x64.zip
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-preview.') }}
