@@ -9,7 +9,7 @@ endif()
 
 add_executable(MH3WorldControls WIN32 MH3WorldControls.cpp)
 target_compile_features(MH3WorldControls PRIVATE cxx_std_17)
-target_link_libraries(MH3WorldControls PRIVATE user32 gdi32 shell32)
+target_link_libraries(MH3WorldControls PRIVATE user32 gdi32 shell32 comctl32)
 
 if(MSVC)
   target_compile_options(MH3WorldControls PRIVATE /W4 /permissive- /EHsc /utf-8)

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-preview.6
+
+- Made controller connection notifications match the configured gather button.
+- Added single-click tray restore, a right-click tray menu, and tray icon recovery after Explorer restarts.
+- Added bounded spin controls and smooth, balanced, and agile wheel presets to the settings window.
+- Staged INI changes before replacing the live configuration so failed saves leave the previous file intact.
+
 ## 0.1.0-preview.5
 
 - Added Windows notifications when an XInput controller connects or disconnects, including startup detection.

@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <Xinput.h>
+#include <commctrl.h>
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,7 @@ constexpr wchar_t kWindowClassName[] = L"MH3WorldControlsWindow";
 constexpr wchar_t kSettingsWindowClassName[] = L"MH3WorldControlsSettingsWindow";
 constexpr UINT_PTR kTrayIconId = 1;
 constexpr int kSettingsGatherButton = 2001;
+constexpr int kSettingsWheelPreset = 2009;
 constexpr int kSettingsWheelInitialDelay = 2001 + 1;
 constexpr int kSettingsWheelPulse = 2001 + 2;
 constexpr int kSettingsWheelStep = 2001 + 3;
@@ -42,6 +44,10 @@ constexpr int kSettingsGatherInterval = 2001 + 7;
 constexpr int kSettingsSave = 2010;
 constexpr int kSettingsDefaults = 2011;
 constexpr int kSettingsCancel = 2012;
+constexpr int kTrayShow = 3001;
+constexpr int kTraySettings = 3002;
+constexpr int kTrayToggleWheel = 3003;
+constexpr int kTrayExit = 3004;
 std::atomic<WORD> g_controllerGatherButton{XINPUT_GAMEPAD_B};
 
 struct WheelTiming {
@@ -93,8 +99,10 @@ HBRUSH g_settingsEditBrush = nullptr;
 HBRUSH g_settingsListBrush = nullptr;
 NOTIFYICONDATAW g_trayIconData{};
 bool g_trayIconAdded = false;
+bool g_trayIconVersion4 = false;
 bool g_controllerStateInitialized = false;
 DWORD g_lastNotifiedControllerMask = 0;
+UINT g_taskbarCreatedMessage = 0;
 bool g_wheelHotkeyRegistered = false;
 bool g_exitHotkeyRegistered = false;
 HHOOK g_keyboardHook = nullptr;
@@ -110,6 +118,7 @@ constexpr WORD kMouseRightAction = 0xFFFF;
 constexpr ULONG_PTR kWheelActionTag = 0x4D483357; // "MH3W"
 
 void Log(const std::string& message);
+void OpenSettingsWindow();
 
 WheelTiming GetWheelTiming() {
     std::lock_guard<std::mutex> lock(g_settingsMutex);
@@ -960,11 +969,16 @@ void AddTrayIcon(HWND window) {
     g_trayIconData.cbSize = sizeof(g_trayIconData);
     g_trayIconData.hWnd = window;
     g_trayIconData.uID = kTrayIconId;
+    // Use the HWND/ID identity: this portable ZIP can be moved between folders.
     g_trayIconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     g_trayIconData.uCallbackMessage = kTrayCallbackMessage;
     g_trayIconData.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     wcscpy_s(g_trayIconData.szTip, L"MH3 World Controls");
     g_trayIconAdded = Shell_NotifyIconW(NIM_ADD, &g_trayIconData) != FALSE;
+    if (g_trayIconAdded) {
+        g_trayIconData.uVersion = NOTIFYICON_VERSION_4;
+        g_trayIconVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &g_trayIconData) != FALSE;
+    }
 }
 
 void NotifyControllerChange(bool connected, DWORD count) {
@@ -972,8 +986,21 @@ void NotifyControllerChange(bool connected, DWORD count) {
     std::wstring message;
     if (connected) {
         title = L"Mando conectado";
-        message = count == 1 ? L"XInput está listo. Mantén B / Círculo para recolectar."
-                             : L"Se detectó otro mando XInput.";
+        if (count != 1) {
+            message = L"Se detectó otro mando XInput.";
+        } else {
+            const WORD button = g_controllerGatherButton.load(std::memory_order_acquire);
+            if (button == XINPUT_GAMEPAD_B)
+                message = L"XInput listo. Mantén B / Círculo para recolectar.";
+            else if (button == XINPUT_GAMEPAD_A)
+                message = L"XInput listo. Mantén A / Cruz para recolectar.";
+            else if (button == XINPUT_GAMEPAD_X)
+                message = L"XInput listo. Mantén X / Cuadrado para recolectar.";
+            else if (button == XINPUT_GAMEPAD_Y)
+                message = L"XInput listo. Mantén Y / Triángulo para recolectar.";
+            else
+                message = L"XInput listo. La autorecolección está desactivada en Configuración.";
+        }
     } else {
         title = L"Mando desconectado";
         message = count == 0 ? L"No hay mandos XInput conectados."
@@ -1017,6 +1044,47 @@ void RemoveTrayIcon() {
     if (g_trayIconAdded) {
         Shell_NotifyIconW(NIM_DELETE, &g_trayIconData);
         g_trayIconAdded = false;
+    }
+}
+
+void ShowMainWindow(HWND window) {
+    ShowWindow(window, SW_SHOWNORMAL);
+    SetForegroundWindow(window);
+}
+
+void ShowTrayMenu(HWND window) {
+    HMENU menu = CreatePopupMenu();
+    if (menu == nullptr)
+        return;
+
+    AppendMenuW(menu, MF_STRING, kTrayShow, L"Abrir MH3 World Controls");
+    AppendMenuW(menu, MF_STRING, kTraySettings, L"Configuración");
+    AppendMenuW(menu, MF_STRING, kTrayToggleWheel,
+                g_wheelEnabled.load(std::memory_order_acquire) ? L"Pausar rueda" : L"Reactivar rueda");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kTrayExit, L"Cerrar helper");
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    SetForegroundWindow(window);
+    const UINT selected = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                                         cursor.x, cursor.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    PostMessageW(window, WM_NULL, 0, 0);
+
+    switch (selected) {
+    case kTrayShow:
+        ShowMainWindow(window);
+        break;
+    case kTraySettings:
+        OpenSettingsWindow();
+        break;
+    case kTrayToggleWheel:
+        ToggleWheel();
+        break;
+    case kTrayExit:
+        PostMessageW(window, WM_CLOSE, 0, 0);
+        break;
     }
 }
 
@@ -1124,15 +1192,28 @@ void CreateSettingsLabel(HWND window, const wchar_t* text, int y) {
         SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 }
 
-HWND CreateSettingsEdit(HWND window, int id, int y, DWORD value) {
+HWND CreateSettingsEdit(HWND window, int id, int y, DWORD value,
+                        DWORD minimum, DWORD maximum) {
     const std::wstring text = std::to_wstring(value);
     const HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text.c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
         356, y, 112, 27, window,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
-    if (edit != nullptr)
-        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
-    return edit;
+    if (edit == nullptr)
+        return nullptr;
+    SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+
+    HWND spinner = CreateWindowExW(0, UPDOWN_CLASSW, L"",
+        WS_CHILD | WS_VISIBLE | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT,
+        0, y, 0, 0, window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id + 100)), nullptr, nullptr);
+    if (spinner == nullptr) {
+        DestroyWindow(edit);
+        return nullptr;
+    }
+    SendMessageW(spinner, UDM_SETBUDDY, reinterpret_cast<WPARAM>(edit), 0);
+    SendMessageW(spinner, UDM_SETRANGE32, minimum, maximum);
+    return spinner;
 }
 
 void SetSettingsDefaults(HWND window) {
@@ -1141,6 +1222,7 @@ void SetSettingsDefaults(HWND window) {
     SetDlgItemInt(window, kSettingsWheelStep, 150, FALSE);
     SetDlgItemInt(window, kSettingsWheelRelease, 550, FALSE);
     SetDlgItemInt(window, kSettingsPreopenThreshold, 60, FALSE);
+    SendDlgItemMessageW(window, kSettingsWheelPreset, CB_SETCURSEL, 2, 0);
     SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, 0, 0);
     SetDlgItemInt(window, kSettingsGatherPulse, 60, FALSE);
     SetDlgItemInt(window, kSettingsGatherInterval, 300, FALSE);
@@ -1162,6 +1244,10 @@ void PopulateSettings(HWND window) {
                              button == XINPUT_GAMEPAD_X ? 2 :
                              button == XINPUT_GAMEPAD_Y ? 3 : 4;
     SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, selection, 0);
+    const LRESULT preset = timing.stepIntervalMs == 180 ? 1 :
+                           timing.stepIntervalMs == 150 ? 2 :
+                           timing.stepIntervalMs == 120 ? 3 : 0;
+    SendDlgItemMessageW(window, kSettingsWheelPreset, CB_SETCURSEL, preset, 0);
 }
 
 bool ReadSettingsNumber(HWND window, int id, DWORD minimum, DWORD maximum,
@@ -1184,9 +1270,10 @@ bool ReadSettingsNumber(HWND window, int id, DWORD minimum, DWORD maximum,
     return true;
 }
 
-bool WriteIniNumber(const wchar_t* section, const wchar_t* key, DWORD value) {
+bool WriteIniNumber(const std::wstring& iniPath, const wchar_t* section,
+                    const wchar_t* key, DWORD value) {
     const std::wstring text = std::to_wstring(value);
-    return WritePrivateProfileStringW(section, key, text.c_str(), g_configPath.c_str()) != FALSE;
+    return WritePrivateProfileStringW(section, key, text.c_str(), iniPath.c_str()) != FALSE;
 }
 
 void SaveSettings(HWND window) {
@@ -1237,20 +1324,44 @@ void SaveSettings(HWND window) {
                                  selection == 2 ? L"X" :
                                  selection == 3 ? L"Y" : L"OFF";
 
+    const std::wstring stagedConfigPath = g_configPath + L".tmp";
+    if (!CopyFileW(g_configPath.c_str(), stagedConfigPath.c_str(), FALSE)) {
+        const DWORD errorCode = GetLastError();
+        std::wstring message = L"No se pudo preparar una copia segura del INI. Código de Windows: ";
+        message += std::to_wstring(errorCode);
+        MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
+        return;
+    }
+
     bool saved = true;
-    saved = WriteIniNumber(L"Wheel", L"initial_delay_ms", timing.initialDelayMs) && saved;
-    saved = WriteIniNumber(L"Wheel", L"pulse_ms", timing.pulseMs) && saved;
-    saved = WriteIniNumber(L"Wheel", L"step_interval_ms", timing.stepIntervalMs) && saved;
-    saved = WriteIniNumber(L"Wheel", L"release_delay_ms", timing.releaseDelayMs) && saved;
-    saved = WriteIniNumber(L"Wheel", L"preopen_threshold", timing.preopenThreshold) && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"initial_delay_ms", timing.initialDelayMs) && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"pulse_ms", timing.pulseMs) && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"step_interval_ms", timing.stepIntervalMs) && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"release_delay_ms", timing.releaseDelayMs) && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"preopen_threshold", timing.preopenThreshold) && saved;
     saved = WritePrivateProfileStringW(L"Controller", L"gather_button", buttonValue,
-                                       g_configPath.c_str()) != FALSE && saved;
-    saved = WriteIniNumber(L"Controller", L"gather_pulse_ms", timing.gatherPulseMs) && saved;
-    saved = WriteIniNumber(L"Controller", L"gather_interval_ms", timing.gatherIntervalMs) && saved;
-    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_configPath.c_str());
+                                       stagedConfigPath.c_str()) != FALSE && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Controller", L"gather_pulse_ms", timing.gatherPulseMs) && saved;
+    saved = WriteIniNumber(stagedConfigPath, L"Controller", L"gather_interval_ms", timing.gatherIntervalMs) && saved;
+    const bool flushed = WritePrivateProfileStringW(nullptr, nullptr, nullptr,
+                                                     stagedConfigPath.c_str()) != FALSE;
+    saved = flushed && saved;
     if (!saved) {
-        MessageBoxW(window, L"No se pudieron guardar todos los valores. Comprueba los permisos del INI.",
-                    L"Error al guardar", MB_OK | MB_ICONERROR);
+        const DWORD errorCode = GetLastError();
+        DeleteFileW(stagedConfigPath.c_str());
+        std::wstring message = L"No se pudo guardar la configuración completa; el INI anterior sigue intacto. Código de Windows: ";
+        message += std::to_wstring(errorCode);
+        MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    if (!MoveFileExW(stagedConfigPath.c_str(), g_configPath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD errorCode = GetLastError();
+        DeleteFileW(stagedConfigPath.c_str());
+        std::wstring message = L"No se pudo reemplazar MH3WorldControls.ini. Los valores no se aplicaron. Código de Windows: ";
+        message += std::to_wstring(errorCode);
+        MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -1277,7 +1388,7 @@ void DrawSettingsWindow(HDC dc, const RECT& client) {
     DrawUiText(dc, L"Ajusta los controles y aplica sin reiniciar", subtitle, kUiMuted, g_uiFont);
 
     DrawUiCard(dc, RECT{20, 78, client.right - 20, 292});
-    RECT wheelHeader{39, 88, client.right - 38, 112};
+    RECT wheelHeader{39, 88, 220, 112};
     DrawUiText(dc, L"RUEDA DEL RATÓN", wheelHeader, kUiCyan, g_uiBoldFont);
     DrawUiCard(dc, RECT{20, 303, client.right - 20, 452});
     RECT controllerHeader{39, 313, client.right - 38, 337};
@@ -1290,6 +1401,7 @@ void DrawSettingsWindow(HDC dc, const RECT& client) {
 LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
+        CreateSettingsLabel(window, L"Ritmo:", 88);
         CreateSettingsLabel(window, L"Espera inicial (300–1000 ms)", 119);
         CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 150);
         CreateSettingsLabel(window, L"Intervalo entre pasos (100–600 ms)", 181);
@@ -1301,14 +1413,25 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
 
         const WheelTiming timing = GetWheelTiming();
         HWND controls[] = {
-            CreateSettingsEdit(window, kSettingsWheelInitialDelay, 118, timing.initialDelayMs),
-            CreateSettingsEdit(window, kSettingsWheelPulse, 149, timing.pulseMs),
-            CreateSettingsEdit(window, kSettingsWheelStep, 180, timing.stepIntervalMs),
-            CreateSettingsEdit(window, kSettingsWheelRelease, 211, timing.releaseDelayMs),
-            CreateSettingsEdit(window, kSettingsPreopenThreshold, 242, timing.preopenThreshold),
-            CreateSettingsEdit(window, kSettingsGatherPulse, 376, timing.gatherPulseMs),
-            CreateSettingsEdit(window, kSettingsGatherInterval, 407, timing.gatherIntervalMs)
+            CreateSettingsEdit(window, kSettingsWheelInitialDelay, 118, timing.initialDelayMs, 300, 1000),
+            CreateSettingsEdit(window, kSettingsWheelPulse, 149, timing.pulseMs, 50, 100),
+            CreateSettingsEdit(window, kSettingsWheelStep, 180, timing.stepIntervalMs, 100, 600),
+            CreateSettingsEdit(window, kSettingsWheelRelease, 211, timing.releaseDelayMs, 550, 1000),
+            CreateSettingsEdit(window, kSettingsPreopenThreshold, 242, timing.preopenThreshold, 0, WHEEL_DELTA - 1),
+            CreateSettingsEdit(window, kSettingsGatherPulse, 376, timing.gatherPulseMs, 50, 100),
+            CreateSettingsEdit(window, kSettingsGatherInterval, 407, timing.gatherIntervalMs, 200, 1000)
         };
+        HWND wheelPresetCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            337, 87, 143, 150, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsWheelPreset)), nullptr, nullptr);
+        if (wheelPresetCombo != nullptr) {
+            const wchar_t* presets[] = {L"Personalizado", L"Suave · 180 ms",
+                                        L"Equilibrado · 150 ms", L"Ágil · 120 ms"};
+            for (const wchar_t* preset : presets)
+                SendMessageW(wheelPresetCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(preset));
+            SendMessageW(wheelPresetCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        }
         HWND gatherCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
             356, 344, 112, 150, window,
@@ -1330,7 +1453,8 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 352, 473, 148, 42,
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), nullptr, nullptr);
         if (std::any_of(std::begin(controls), std::end(controls), [](HWND control) { return control == nullptr; }) ||
-            gatherCombo == nullptr || defaults == nullptr || save == nullptr || cancel == nullptr)
+            wheelPresetCombo == nullptr || gatherCombo == nullptr || defaults == nullptr ||
+            save == nullptr || cancel == nullptr)
             return -1;
 
         for (HWND control : {defaults, save, cancel})
@@ -1395,6 +1519,22 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
             return 0;
         case kSettingsCancel:
             DestroyWindow(window);
+            return 0;
+        }
+        if (LOWORD(wParam) == kSettingsWheelPreset && HIWORD(wParam) == CBN_SELCHANGE) {
+            const LRESULT preset = SendDlgItemMessageW(window, kSettingsWheelPreset, CB_GETCURSEL, 0, 0);
+            if (preset == 1)
+                SetDlgItemInt(window, kSettingsWheelStep, 180, FALSE);
+            else if (preset == 2)
+                SetDlgItemInt(window, kSettingsWheelStep, 150, FALSE);
+            else if (preset == 3)
+                SetDlgItemInt(window, kSettingsWheelStep, 120, FALSE);
+            return 0;
+        }
+        if (LOWORD(wParam) == kSettingsWheelStep && HIWORD(wParam) == EN_CHANGE &&
+            (GetFocus() == GetDlgItem(window, kSettingsWheelStep) ||
+             GetDlgCtrlID(GetFocus()) == kSettingsWheelStep + 100)) {
+            SendDlgItemMessageW(window, kSettingsWheelPreset, CB_SETCURSEL, 0, 0);
             return 0;
         }
         break;
@@ -1468,6 +1608,12 @@ void OpenSettingsWindow() {
 }
 
 LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (g_taskbarCreatedMessage != 0 && message == g_taskbarCreatedMessage) {
+        g_trayIconAdded = false;
+        AddTrayIcon(window);
+        return 0;
+    }
+
     switch (message) {
     case WM_CREATE: {
         g_uiFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -1567,12 +1713,19 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         }
         break;
     case kTrayCallbackMessage:
-        if (lParam == WM_LBUTTONDBLCLK) {
-            ShowWindow(window, SW_SHOWNORMAL);
-            SetForegroundWindow(window);
+    {
+        const UINT event = g_trayIconVersion4 ? LOWORD(lParam) : static_cast<UINT>(lParam);
+        if (event == NIN_SELECT || event == NIN_KEYSELECT || event == WM_LBUTTONUP ||
+            event == WM_LBUTTONDBLCLK) {
+            ShowMainWindow(window);
+            return 0;
+        }
+        if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) {
+            ShowTrayMenu(window);
             return 0;
         }
         break;
+    }
     case WM_CLOSE:
         DestroyWindow(window);
         return 0;
@@ -1623,6 +1776,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 0;
     LoadWheelTiming();
     LoadXInput();
+
+    INITCOMMONCONTROLSEX commonControls{};
+    commonControls.dwSize = sizeof(commonControls);
+    commonControls.dwICC = ICC_UPDOWN_CLASS;
+    if (!InitCommonControlsEx(&commonControls)) {
+        MessageBoxW(nullptr, L"No se pudieron inicializar los controles de configuración.",
+                    L"MH3 World Controls", MB_OK | MB_ICONERROR);
+        if (g_xinputModule != nullptr)
+            FreeLibrary(g_xinputModule);
+        CloseHandle(g_instanceGuard);
+        return 1;
+    }
+    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
 
     MSG message{};
     PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE); // Create the queue before the hook posts wheel deltas.
