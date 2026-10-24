@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-preview.7
+
+- Fixed Save and Apply rejecting a successful Windows INI cache flush as an error.
+- The helper now records actual profile-write failures and checks the staged file flush before replacing the existing INI.
+
 ## 0.1.0-preview.6
 
 - Made controller connection notifications match the configured gather button.

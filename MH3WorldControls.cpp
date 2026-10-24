@@ -1334,23 +1334,55 @@ void SaveSettings(HWND window) {
     }
 
     bool saved = true;
-    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"initial_delay_ms", timing.initialDelayMs) && saved;
-    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"pulse_ms", timing.pulseMs) && saved;
-    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"step_interval_ms", timing.stepIntervalMs) && saved;
-    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"release_delay_ms", timing.releaseDelayMs) && saved;
-    saved = WriteIniNumber(stagedConfigPath, L"Wheel", L"preopen_threshold", timing.preopenThreshold) && saved;
-    saved = WritePrivateProfileStringW(L"Controller", L"gather_button", buttonValue,
-                                       stagedConfigPath.c_str()) != FALSE && saved;
-    saved = WriteIniNumber(stagedConfigPath, L"Controller", L"gather_pulse_ms", timing.gatherPulseMs) && saved;
-    saved = WriteIniNumber(stagedConfigPath, L"Controller", L"gather_interval_ms", timing.gatherIntervalMs) && saved;
-    const bool flushed = WritePrivateProfileStringW(nullptr, nullptr, nullptr,
-                                                     stagedConfigPath.c_str()) != FALSE;
-    saved = flushed && saved;
+    DWORD saveError = ERROR_SUCCESS;
+    const auto recordWrite = [&saved, &saveError](bool succeeded) {
+        if (succeeded)
+            return;
+        saved = false;
+        if (saveError == ERROR_SUCCESS) {
+            saveError = GetLastError();
+            if (saveError == ERROR_SUCCESS)
+                saveError = ERROR_WRITE_FAULT;
+        }
+    };
+    const auto writeNumber = [&stagedConfigPath, &recordWrite](const wchar_t* section,
+                                                                const wchar_t* key, DWORD value) {
+        SetLastError(ERROR_SUCCESS);
+        recordWrite(WriteIniNumber(stagedConfigPath, section, key, value));
+    };
+
+    writeNumber(L"Wheel", L"initial_delay_ms", timing.initialDelayMs);
+    writeNumber(L"Wheel", L"pulse_ms", timing.pulseMs);
+    writeNumber(L"Wheel", L"step_interval_ms", timing.stepIntervalMs);
+    writeNumber(L"Wheel", L"release_delay_ms", timing.releaseDelayMs);
+    writeNumber(L"Wheel", L"preopen_threshold", timing.preopenThreshold);
+    SetLastError(ERROR_SUCCESS);
+    recordWrite(WritePrivateProfileStringW(L"Controller", L"gather_button", buttonValue,
+                                           stagedConfigPath.c_str()) != FALSE);
+    writeNumber(L"Controller", L"gather_pulse_ms", timing.gatherPulseMs);
+    writeNumber(L"Controller", L"gather_interval_ms", timing.gatherIntervalMs);
+
+    // WritePrivateProfileString returns zero when asked to flush its profile cache,
+    // including after a successful flush. Verify the file itself instead of using
+    // that ambiguous return value as a write failure.
+    SetLastError(ERROR_SUCCESS);
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, stagedConfigPath.c_str());
+    SetLastError(ERROR_SUCCESS);
+    HANDLE stagedFile = CreateFileW(stagedConfigPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (stagedFile == INVALID_HANDLE_VALUE) {
+        recordWrite(false);
+    } else {
+        SetLastError(ERROR_SUCCESS);
+        const bool fileFlushed = FlushFileBuffers(stagedFile) != FALSE;
+        if (!fileFlushed)
+            recordWrite(false);
+        CloseHandle(stagedFile);
+    }
     if (!saved) {
-        const DWORD errorCode = GetLastError();
         DeleteFileW(stagedConfigPath.c_str());
         std::wstring message = L"No se pudo guardar la configuración completa; el INI anterior sigue intacto. Código de Windows: ";
-        message += std::to_wstring(errorCode);
+        message += std::to_wstring(saveError);
         MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
         return;
     }
