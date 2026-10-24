@@ -23,6 +23,7 @@ MH3 World Controls mejora dos controles repetitivos de **OceanTriRecomp**: cambi
 - Descarta el scroll durante acciones de combate detectadas para no cancelar cargas ni reproducir selecciones después.
 - Evita que los pulsos de selección se conviertan en usos accidentales de objetos.
 - Repite la recolección al mantener F o el botón A lógico del mando: **B en Xbox / Círculo en PlayStation**.
+- Permite cambiar el botón de autorecolección de mando o desactivarlo desde el INI.
 - Deja F8 para pausar o reactivar la rueda y F9 para cerrar el helper.
 
 ### Requisitos
@@ -62,6 +63,8 @@ Los tiempos están en `MH3WorldControls.ini`, junto al ejecutable:
 
 Reinicia el helper para aplicar cambios. Los valores más altos hacen la navegación más pausada. Mantén los mínimos de espera y liberación: ayudan a que la selección no se confunda con el uso del objeto.
 
+En `[Controller]`, `gather_button` elige el botón físico XInput que activa los pulsos de recolección: `A`, `B`, `X`, `Y` u `OFF`. El valor inicial `B` coincide con el botón Este del mapeo predeterminado del juego.
+
 ### Solución de problemas
 
 - **La rueda no cambia objetos:** confirma que el helper está abierto y que OceanTriRecomp tiene el foco. Revisa que otra aplicación no esté capturando la rueda.
@@ -98,6 +101,7 @@ MH3 World Controls is a small Windows quality-of-life helper for **OceanTriRecom
 - Discard wheel input during detected combat actions to avoid interrupting charges or replaying queued selections afterward.
 - Use guarded, short selection pulses to reduce accidental item use.
 - Repeat gathering while holding F or the logical Confirm button: **Xbox B / PlayStation Circle**.
+- Configure the XInput gather button or turn controller auto-gather off in the INI.
 - F8 toggles wheel capture; F9 exits the helper.
 
 ### Requirements and setup
@@ -108,6 +112,8 @@ MH3 World Controls is a small Windows quality-of-life helper for **OceanTriRecom
 - The helper only acts while OceanTriRecomp is in the foreground. Run both programs at the same permission level.
 
 The timing values can be edited in `MH3WorldControls.ini` beside the executable. See the Spanish section above for the setting names and supported ranges.
+
+In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping.
 
 ### Build
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-preview.2
+
+- Made the XInput auto-gather button configurable (`A`, `B`, `X`, `Y`, or `OFF`).
+- Read each connected XInput controller once per helper poll instead of polling the same state twice.
+- Reduced GitHub Actions write access to the release job and pinned workflow actions to commit SHAs.
+
 ## 0.1.0-preview.1 — initial public package
 
 - Added guarded mouse-wheel item selection with a configurable, controllable pace.

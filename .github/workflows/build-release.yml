@@ -8,14 +8,14 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: windows-2022
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Configure x64 Release
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -34,15 +34,28 @@ jobs:
           Compress-Archive -Path package/* -DestinationPath MH3WorldControls-Windows-x64.zip -Force
 
       - name: Upload build package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: MH3WorldControls-Windows-x64
           path: MH3WorldControls-Windows-x64.zip
 
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          files: MH3WorldControls-Windows-x64.zip
+          name: MH3WorldControls-Windows-x64
+          path: dist
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836 # v2.3.3
+        with:
+          files: dist/MH3WorldControls-Windows-x64.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
           generate_release_notes: true
           prerelease: ${{ contains(github.ref, '-preview.') }}

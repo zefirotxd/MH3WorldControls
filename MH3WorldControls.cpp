@@ -21,6 +21,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr wchar_t kGameExecutable[] = L"OceanTriRecomp.exe";
 constexpr UINT kWheelDeltaMessage = WM_APP + 0x31;
+WORD g_controllerGatherButton = XINPUT_GAMEPAD_B;
 
 struct WheelTiming {
     DWORD initialDelayMs = 300;
@@ -99,6 +100,24 @@ void LoadWheelTiming() {
     const UINT rawPreopenThreshold = GetPrivateProfileIntW(L"Wheel", L"preopen_threshold", 60,
                                                             configPath.c_str());
     g_wheelTiming.preopenThreshold = std::min<DWORD>(rawPreopenThreshold, WHEEL_DELTA - 1);
+
+    wchar_t gatherButton[16]{};
+    GetPrivateProfileStringW(L"Controller", L"gather_button", L"B", gatherButton,
+                              static_cast<DWORD>(std::size(gatherButton)), configPath.c_str());
+    if (CompareStringOrdinal(gatherButton, -1, L"A", -1, TRUE) == CSTR_EQUAL)
+        g_controllerGatherButton = XINPUT_GAMEPAD_A;
+    else if (CompareStringOrdinal(gatherButton, -1, L"B", -1, TRUE) == CSTR_EQUAL)
+        g_controllerGatherButton = XINPUT_GAMEPAD_B;
+    else if (CompareStringOrdinal(gatherButton, -1, L"X", -1, TRUE) == CSTR_EQUAL)
+        g_controllerGatherButton = XINPUT_GAMEPAD_X;
+    else if (CompareStringOrdinal(gatherButton, -1, L"Y", -1, TRUE) == CSTR_EQUAL)
+        g_controllerGatherButton = XINPUT_GAMEPAD_Y;
+    else if (CompareStringOrdinal(gatherButton, -1, L"OFF", -1, TRUE) == CSTR_EQUAL)
+        g_controllerGatherButton = 0;
+    else {
+        g_controllerGatherButton = XINPUT_GAMEPAD_B;
+        Log("Controller.gather_button invalido; se usara B como valor seguro.");
+    }
 }
 
 void Log(const std::string& message) {
@@ -261,9 +280,15 @@ void LoadXInput() {
     Log("Aviso: no se detecto XInput; la autorecoleccion con mando no estara disponible.");
 }
 
-bool IsXInputGameplayActionHeld() {
+struct XInputHeldActions {
+    bool gameplayAction = false;
+    bool pickupButton = false;
+};
+
+XInputHeldActions ReadXInputHeldActions() {
+    XInputHeldActions held;
     if (g_xinputGetState == nullptr)
-        return false;
+        return held;
 
     constexpr WORD kCombatButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B |
                                    XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y |
@@ -282,27 +307,16 @@ bool IsXInputGameplayActionHeld() {
                             std::abs(int(pad.sThumbLY)) >= 12000;
         if ((pad.wButtons & kCombatButtons) != 0 ||
             (rightShoulderHeld && !moving) || pad.bRightTrigger >= 32) {
-            return true;
+            held.gameplayAction = true;
         }
-    }
-    return false;
-}
-
-bool IsXInputPickupButtonHeld() {
-    if (g_xinputGetState == nullptr)
-        return false;
-
-    // In OceanTriRecomp's default SDL mapping, logical A (Confirmar) is the
-    // East face button: B on Xbox layouts and Circle on PlayStation layouts.
-    // XInput exposes that physical position as XINPUT_GAMEPAD_B.
-    for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex) {
-        XINPUT_STATE state{};
-        if (g_xinputGetState(userIndex, &state) == ERROR_SUCCESS &&
-            (state.Gamepad.wButtons & XINPUT_GAMEPAD_B) != 0) {
-            return true;
+        if (g_controllerGatherButton != 0 &&
+            (pad.wButtons & g_controllerGatherButton) != 0) {
+            held.pickupButton = true;
         }
+        if (held.gameplayAction && held.pickupButton)
+            break;
     }
-    return false;
+    return held;
 }
 
 bool IsAnyGameplayActionPhysicallyHeld() {
@@ -445,7 +459,7 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
         return;
 
     if (actionHeldAtScroll || IsAnyGameplayActionPhysicallyHeld() ||
-        IsXInputGameplayActionHeld()) {
+        ReadXInputHeldActions().gameplayAction) {
         // Scrolling during a charge is ignored, never queued for after the attack.
         DiscardPendingWheelInput(true);
         return;
@@ -570,11 +584,12 @@ void PickupWorker() {
     while (g_running.load(std::memory_order_acquire)) {
         const auto now = Clock::now();
         const bool gameFocused = IsGameForeground();
-        g_controllerActionHeld.store(gameFocused && IsXInputGameplayActionHeld(),
+        const XInputHeldActions xinput = gameFocused ? ReadXInputHeldActions() : XInputHeldActions{};
+        g_controllerActionHeld.store(xinput.gameplayAction,
                                      std::memory_order_release);
         const bool pickupHeld = gameFocused &&
                                 (g_pickupHeld.load(std::memory_order_acquire) ||
-                                 IsXInputPickupButtonHeld());
+                                 xinput.pickupButton);
 
         if (gameFocused != lastGameFocused) {
             Log(gameFocused ? "OceanTriRecomp esta enfocada; el helper puede enviar controles." :
