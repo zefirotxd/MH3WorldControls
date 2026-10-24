@@ -7,7 +7,7 @@ if(NOT WIN32)
   message(FATAL_ERROR "MH3WorldControls currently supports Windows only.")
 endif()
 
-add_executable(MH3WorldControls WIN32 MH3WorldControls.cpp)
+add_executable(MH3WorldControls WIN32 MH3WorldControls.cpp MH3WorldControls.rc)
 target_compile_features(MH3WorldControls PRIVATE cxx_std_17)
 target_link_libraries(MH3WorldControls PRIVATE user32 gdi32 shell32 comctl32)
 

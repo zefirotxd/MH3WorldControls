@@ -30,6 +30,7 @@ jobs:
           Copy-Item build/Release/MH3WorldControls.exe package/
           Copy-Item MH3WorldControls.ini package/
           Copy-Item README.md package/
+          Copy-Item CHANGELOG.md package/
           Copy-Item LICENSE package/
           Compress-Archive -Path package/* -DestinationPath MH3WorldControls-Windows-x64.zip -Force
 

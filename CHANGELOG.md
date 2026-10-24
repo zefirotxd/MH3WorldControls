@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.0-preview.8
+
+- Fixed shutdown cleanup so the helper never sends Q-up over a physically held Q key.
+- Moved low-level keyboard and mouse hooks to a dedicated message thread and removed process-image queries from the keyboard hook callback.
+- Moved active settings to `%LOCALAPPDATA%\MH3WorldControls`, with automatic migration from the old beside-the-executable INI and support for creating a missing configuration on save.
+- Added configurable wheel sensitivity and direction while preserving fractional high-resolution wheel deltas.
+- Added optional per-controller auto-gather selection and configurable extra action-guard keys.
+- Added visible queue/drop counts and a privacy-conscious copy-diagnostics action.
+- Added wheel/focus details to the dashboard, keyboard-focus outlines, per-monitor DPI scaling, and Windows executable version metadata.
+- Added a size-limited rolling status log and an option to mute controller connection notifications.
+- Included the changelog in release packages and documented the new controls.
+
 ## 0.1.0-preview.7
 
 - Fixed Save and Apply rejecting a successful Windows INI cache flush as an error.

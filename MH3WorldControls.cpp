@@ -8,7 +8,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <cwctype>
 #include <cwchar>
 #include <deque>
 #include <iterator>
@@ -18,6 +20,7 @@
 #include <thread>
 #include <utility>
 #include <shellapi.h>
+#include <vector>
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -44,11 +47,30 @@ constexpr int kSettingsGatherInterval = 2001 + 7;
 constexpr int kSettingsSave = 2010;
 constexpr int kSettingsDefaults = 2011;
 constexpr int kSettingsCancel = 2012;
+constexpr int kSettingsGatherController = 2013;
+constexpr int kSettingsExtraGuardKeys = 2014;
+constexpr int kSettingsWheelInvert = 2015;
+constexpr int kSettingsWheelSensitivity = 2016;
+constexpr int kSettingsControllerNotifications = 2017;
 constexpr int kTrayShow = 3001;
 constexpr int kTraySettings = 3002;
 constexpr int kTrayToggleWheel = 3003;
 constexpr int kTrayExit = 3004;
+constexpr int kTrayCopyDiagnostics = 3005;
+constexpr int kCopyDiagnosticsButton = 1004;
+constexpr wchar_t kAppVersion[] = L"0.1.0-preview.8";
+constexpr int kMainLogicalWidth = 720;
+constexpr int kMainLogicalHeight = 540;
+constexpr int kSettingsLogicalWidth = 520;
+constexpr int kSettingsLogicalHeight = 665;
+constexpr int kMaxExtraGuardKeys = 8;
+constexpr int64_t kWheelDeltaScale = 100;
+constexpr int64_t kScaledWheelNotch = int64_t(WHEEL_DELTA) * kWheelDeltaScale;
 std::atomic<WORD> g_controllerGatherButton{XINPUT_GAMEPAD_B};
+std::atomic<int> g_gatherControllerIndex{-1}; // -1 means any connected controller.
+std::atomic<bool> g_controllerNotificationsEnabled{true};
+std::array<std::atomic<int>, kMaxExtraGuardKeys> g_extraGuardKeys{};
+std::atomic<DWORD> g_extraGuardKeyCount{0};
 
 struct WheelTiming {
     DWORD initialDelayMs = 300;
@@ -58,6 +80,8 @@ struct WheelTiming {
     DWORD preopenThreshold = 60;
     DWORD gatherPulseMs = 60;
     DWORD gatherIntervalMs = 300;
+    DWORD wheelSensitivityPercent = 100;
+    bool invertWheel = false;
 };
 WheelTiming g_wheelTiming;
 
@@ -71,30 +95,38 @@ std::atomic<bool> g_physicalXHeld{false};
 std::atomic<bool> g_controllerActionHeld{false};
 std::atomic<bool> g_wheelModifierInjected{false};
 std::atomic<bool> g_wheelModifierPending{false};
+std::atomic<bool> g_wheelBusySnapshot{false};
+std::atomic<bool> g_deferredItemKeyRelease{false};
 std::atomic<ULONGLONG> g_wheelReleaseAt{0};
 std::atomic<ULONGLONG> g_wheelReadyAt{0};
 std::atomic<DWORD> g_gameProcessId{0};
 std::atomic<DWORD> g_connectedControllerCount{0};
 std::atomic<DWORD> g_connectedControllerMask{0};
+std::atomic<DWORD> g_droppedWheelSteps{0};
 std::mutex g_wheelMutex;
 std::mutex g_foregroundCacheMutex;
 std::mutex g_statusMutex;
 std::mutex g_settingsMutex;
+std::mutex g_fileLogMutex;
 std::deque<WORD> g_wheelDirections;
 std::wstring g_configPath;
 std::wstring g_latestLog;
-int g_pendingWheelDelta = 0;
+std::wstring g_extraGuardKeysText;
+int64_t g_pendingWheelDelta = 0;
 bool g_wheelBusy = false;
-bool g_deferredItemKeyRelease = false;
 DWORD g_cachedForegroundPid = 0;
 bool g_cachedForegroundIsGame = false;
 Clock::time_point g_foregroundCacheUpdatedAt{};
 DWORD g_mainThreadId = 0;
+DWORD g_hookThreadId = 0;
+UINT g_uiDpi = 96;
 HWND g_mainWindow = nullptr;
 HWND g_settingsWindow = nullptr;
 HWND g_toggleWheelControl = nullptr;
 HFONT g_uiFont = nullptr;
 HFONT g_uiBoldFont = nullptr;
+HFONT g_uiPaintFont = nullptr;
+HFONT g_uiPaintBoldFont = nullptr;
 HBRUSH g_settingsEditBrush = nullptr;
 HBRUSH g_settingsListBrush = nullptr;
 NOTIFYICONDATAW g_trayIconData{};
@@ -108,6 +140,8 @@ bool g_exitHotkeyRegistered = false;
 HHOOK g_keyboardHook = nullptr;
 HHOOK g_mouseHook = nullptr;
 HANDLE g_instanceGuard = nullptr;
+HANDLE g_hookReadyEvent = nullptr;
+std::atomic<DWORD> g_hookErrorCode{ERROR_SUCCESS};
 HMODULE g_xinputModule = nullptr;
 using XInputGetStateProc = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 XInputGetStateProc g_xinputGetState = nullptr;
@@ -120,6 +154,294 @@ constexpr ULONG_PTR kWheelActionTag = 0x4D483357; // "MH3W"
 void Log(const std::string& message);
 void OpenSettingsWindow();
 
+constexpr wchar_t kDpiPropertyName[] = L"MH3WorldControls.WindowDpi";
+
+int ScaleUi(int value) {
+    return MulDiv(value, static_cast<int>(g_uiDpi), 96);
+}
+
+void EnableDpiAwareness() {
+    using SetDpiContextProc = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto setDpiContext = reinterpret_cast<SetDpiContextProc>(
+        user32 != nullptr ? GetProcAddress(user32, "SetProcessDpiAwarenessContext") : nullptr);
+    if (setDpiContext != nullptr &&
+        setDpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        return;
+    SetProcessDPIAware();
+}
+
+UINT GetSystemDpiSafe() {
+    using GetDpiForSystemProc = UINT(WINAPI*)();
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto getDpiForSystem = reinterpret_cast<GetDpiForSystemProc>(
+        user32 != nullptr ? GetProcAddress(user32, "GetDpiForSystem") : nullptr);
+    if (getDpiForSystem != nullptr) {
+        const UINT dpi = getDpiForSystem();
+        if (dpi != 0)
+            return dpi;
+    }
+    const HDC screen = GetDC(nullptr);
+    if (screen == nullptr)
+        return 96;
+    const int dpi = GetDeviceCaps(screen, LOGPIXELSX);
+    ReleaseDC(nullptr, screen);
+    return dpi > 0 ? static_cast<UINT>(dpi) : 96;
+}
+
+BOOL AdjustWindowRectForDpiSafe(LPRECT rect, DWORD style, BOOL hasMenu,
+                                DWORD extendedStyle, UINT dpi) {
+    using AdjustWindowRectForDpiProc = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    const auto adjustForDpi = reinterpret_cast<AdjustWindowRectForDpiProc>(
+        user32 != nullptr ? GetProcAddress(user32, "AdjustWindowRectExForDpi") : nullptr);
+    return adjustForDpi != nullptr
+               ? adjustForDpi(rect, style, hasMenu, extendedStyle, dpi)
+               : AdjustWindowRectEx(rect, style, hasMenu, extendedStyle);
+}
+
+bool CreateUiFonts(UINT dpi) {
+    const int scaledNormalHeight = -MulDiv(16, static_cast<int>(dpi), 96);
+    const int scaledBoldHeight = -MulDiv(18, static_cast<int>(dpi), 96);
+    HFONT normal = CreateFontW(scaledNormalHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT bold = CreateFontW(scaledBoldHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT paintNormal = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT paintBold = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    if (normal == nullptr || bold == nullptr || paintNormal == nullptr || paintBold == nullptr) {
+        for (HGDIOBJ font : {reinterpret_cast<HGDIOBJ>(normal), reinterpret_cast<HGDIOBJ>(bold),
+                             reinterpret_cast<HGDIOBJ>(paintNormal), reinterpret_cast<HGDIOBJ>(paintBold)}) {
+            if (font != nullptr)
+                DeleteObject(font);
+        }
+        return false;
+    }
+    for (HGDIOBJ font : {reinterpret_cast<HGDIOBJ>(g_uiFont), reinterpret_cast<HGDIOBJ>(g_uiBoldFont),
+                         reinterpret_cast<HGDIOBJ>(g_uiPaintFont),
+                         reinterpret_cast<HGDIOBJ>(g_uiPaintBoldFont)}) {
+        if (font != nullptr)
+            DeleteObject(font);
+    }
+    g_uiFont = normal;
+    g_uiBoldFont = bold;
+    g_uiPaintFont = paintNormal;
+    g_uiPaintBoldFont = paintBold;
+    return true;
+}
+
+BOOL CALLBACK ApplyFontToChild(HWND child, LPARAM) {
+    const int id = GetDlgCtrlID(child);
+    const bool bold = id == kToggleWheelButton || id == kOpenConfigButton ||
+                      id == kCopyDiagnosticsButton || id == kExitButton ||
+                      id == kSettingsSave || id == kSettingsDefaults || id == kSettingsCancel;
+    SendMessageW(child, WM_SETFONT,
+                 reinterpret_cast<WPARAM>(bold ? g_uiBoldFont : g_uiFont), TRUE);
+    return TRUE;
+}
+
+void ApplyFontsToChildren(HWND parent) {
+    if (parent != nullptr)
+        EnumChildWindows(parent, ApplyFontToChild, 0);
+}
+
+struct DpiScaleContext {
+    HWND parent = nullptr;
+    UINT oldDpi = 96;
+    UINT newDpi = 96;
+};
+
+BOOL CALLBACK ScaleChildForDpi(HWND child, LPARAM parameter) {
+    const auto* context = reinterpret_cast<const DpiScaleContext*>(parameter);
+    RECT screenRect{};
+    if (!GetWindowRect(child, &screenRect))
+        return TRUE;
+    POINT points[2]{{screenRect.left, screenRect.top}, {screenRect.right, screenRect.bottom}};
+    MapWindowPoints(HWND_DESKTOP, context->parent, points, 2);
+    const int left = MulDiv(points[0].x, static_cast<int>(context->newDpi),
+                            static_cast<int>(context->oldDpi));
+    const int top = MulDiv(points[0].y, static_cast<int>(context->newDpi),
+                           static_cast<int>(context->oldDpi));
+    const int width = MulDiv(points[1].x - points[0].x, static_cast<int>(context->newDpi),
+                             static_cast<int>(context->oldDpi));
+    const int height = MulDiv(points[1].y - points[0].y, static_cast<int>(context->newDpi),
+                              static_cast<int>(context->oldDpi));
+    SetWindowPos(child, nullptr, left, top, width, height,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+    return TRUE;
+}
+
+void HandleDpiChanged(HWND window, UINT newDpi, const RECT* suggestedBounds) {
+    UINT oldDpi = static_cast<UINT>(reinterpret_cast<ULONG_PTR>(GetPropW(window, kDpiPropertyName)));
+    if (oldDpi == 0)
+        oldDpi = g_uiDpi;
+    if (newDpi == 0)
+        newDpi = oldDpi;
+    if (newDpi != g_uiDpi) {
+        g_uiDpi = newDpi;
+        if (CreateUiFonts(g_uiDpi)) {
+            ApplyFontsToChildren(g_mainWindow);
+            ApplyFontsToChildren(g_settingsWindow);
+        }
+    }
+    if (oldDpi != newDpi) {
+        const DpiScaleContext context{window, oldDpi, newDpi};
+        EnumChildWindows(window, ScaleChildForDpi,
+                         reinterpret_cast<LPARAM>(&context));
+    }
+    SetPropW(window, kDpiPropertyName, reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(newDpi)));
+    if (suggestedBounds != nullptr) {
+        SetWindowPos(window, nullptr, suggestedBounds->left, suggestedBounds->top,
+                     suggestedBounds->right - suggestedBounds->left,
+                     suggestedBounds->bottom - suggestedBounds->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+std::wstring GetExecutablePath() {
+    std::vector<wchar_t> path(512);
+    while (path.size() <= 32768) {
+        const DWORD length = GetModuleFileNameW(nullptr, path.data(),
+                                                 static_cast<DWORD>(path.size()));
+        if (length == 0)
+            return {};
+        if (length < path.size())
+            return std::wstring(path.data(), length);
+        path.resize(path.size() * 2);
+    }
+    return {};
+}
+
+std::wstring GetExecutableDirectory() {
+    const std::wstring executablePath = GetExecutablePath();
+    const size_t separator = executablePath.find_last_of(L"\\/");
+    return separator == std::wstring::npos ? std::wstring{} : executablePath.substr(0, separator);
+}
+
+void InitializeConfigPath() {
+    const std::wstring executableDirectory = GetExecutableDirectory();
+    const std::wstring legacyPath = executableDirectory.empty()
+                                        ? std::wstring{}
+                                        : executableDirectory + L"\\MH3WorldControls.ini";
+
+    const DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (required > 1) {
+        std::vector<wchar_t> localAppData(required);
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData.data(), required);
+        if (length > 0 && length < required) {
+            const std::wstring configDirectory = std::wstring(localAppData.data(), length) +
+                                                  L"\\MH3WorldControls";
+            if (CreateDirectoryW(configDirectory.c_str(), nullptr) ||
+                GetLastError() == ERROR_ALREADY_EXISTS) {
+                const DWORD attributes = GetFileAttributesW(configDirectory.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES &&
+                    (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    g_configPath = configDirectory + L"\\MH3WorldControls.ini";
+                    const DWORD configAttributes = GetFileAttributesW(g_configPath.c_str());
+                    if (configAttributes == INVALID_FILE_ATTRIBUTES && !legacyPath.empty() &&
+                        CompareStringOrdinal(g_configPath.c_str(), -1, legacyPath.c_str(), -1,
+                                             TRUE) != CSTR_EQUAL &&
+                        GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        if (CopyFileW(legacyPath.c_str(), g_configPath.c_str(), TRUE))
+                            Log("Configuracion anterior migrada a LocalAppData.");
+                        else
+                            Log("No se pudo migrar el INI anterior; se usaran los valores seguros.");
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    g_configPath = legacyPath;
+    Log(g_configPath.empty()
+            ? "No se pudo determinar una carpeta para MH3WorldControls.ini."
+            : "LocalAppData no esta disponible; se usara la carpeta del helper para el INI.");
+}
+
+std::wstring Trim(const std::wstring& value) {
+    const size_t first = value.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos)
+        return {};
+    const size_t last = value.find_last_not_of(L" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+int ParseGuardKeyToken(std::wstring token) {
+    token = Trim(token);
+    std::transform(token.begin(), token.end(), token.begin(),
+                   [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
+    if (token.size() == 1 && ((token[0] >= L'A' && token[0] <= L'Z') ||
+                              (token[0] >= L'0' && token[0] <= L'9')))
+        return static_cast<int>(token[0]);
+    if (token == L"SPACE") return VK_SPACE;
+    if (token == L"TAB") return VK_TAB;
+    if (token == L"ENTER") return VK_RETURN;
+    if (token == L"ESC") return VK_ESCAPE;
+    if (token == L"BACKSPACE") return VK_BACK;
+    if (token == L"SHIFT") return VK_SHIFT;
+    if (token == L"CTRL") return VK_CONTROL;
+    if (token == L"ALT") return VK_MENU;
+    if (token == L"CAPSLOCK") return VK_CAPITAL;
+    if (token == L"INSERT") return VK_INSERT;
+    if (token == L"DELETE") return VK_DELETE;
+    if (token == L"HOME") return VK_HOME;
+    if (token == L"END") return VK_END;
+    if (token == L"PAGEUP") return VK_PRIOR;
+    if (token == L"PAGEDOWN") return VK_NEXT;
+    if (token == L"UP") return VK_UP;
+    if (token == L"DOWN") return VK_DOWN;
+    if (token == L"LEFT") return VK_LEFT;
+    if (token == L"RIGHT") return VK_RIGHT;
+    if (token.size() >= 2 && token[0] == L'F') {
+        wchar_t* end = nullptr;
+        const long number = std::wcstol(token.c_str() + 1, &end, 10);
+        if (end != token.c_str() + 1 && *end == L'\0' && number >= 1 && number <= 24)
+            return VK_F1 + static_cast<int>(number) - 1;
+    }
+    if (token.size() == 7 && token.compare(0, 6, L"NUMPAD") == 0 &&
+        token[6] >= L'0' && token[6] <= L'9')
+        return VK_NUMPAD0 + static_cast<int>(token[6] - L'0');
+    return 0;
+}
+
+bool ParseExtraGuardKeys(const std::wstring& text, std::array<int, kMaxExtraGuardKeys>& keys,
+                         DWORD& count) {
+    keys.fill(0);
+    count = 0;
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t separator = text.find(L',', start);
+        const std::wstring token = Trim(text.substr(start, separator == std::wstring::npos
+                                                             ? std::wstring::npos
+                                                             : separator - start));
+        const int key = ParseGuardKeyToken(token);
+        if (key == 0 || count >= kMaxExtraGuardKeys)
+            return false;
+        if (std::find(keys.begin(), keys.begin() + count, key) == keys.begin() + count)
+            keys[count++] = key;
+        if (separator == std::wstring::npos)
+            break;
+        start = separator + 1;
+        if (start == text.size())
+            return false;
+    }
+    return true;
+}
+
+void ApplyExtraGuardKeys(const std::array<int, kMaxExtraGuardKeys>& keys, DWORD count) {
+    for (DWORD index = 0; index < kMaxExtraGuardKeys; ++index)
+        g_extraGuardKeys[index].store(index < count ? keys[index] : 0, std::memory_order_release);
+    g_extraGuardKeyCount.store(count, std::memory_order_release);
+}
+
 WheelTiming GetWheelTiming() {
     std::lock_guard<std::mutex> lock(g_settingsMutex);
     return g_wheelTiming;
@@ -130,24 +452,17 @@ void ApplyWheelTiming(const WheelTiming& timing) {
     g_wheelTiming = timing;
 }
 
-void LoadWheelTiming() {
-    wchar_t executablePath[MAX_PATH]{};
-    const DWORD length = GetModuleFileNameW(nullptr, executablePath,
-                                            static_cast<DWORD>(std::size(executablePath)));
-    if (length == 0 || length >= std::size(executablePath)) {
-        Log("No se pudo localizar MH3WorldControls.ini; se usaran los tiempos seguros por defecto.");
-        return;
-    }
+void SetWheelBusyLocked(bool busy) {
+    g_wheelBusy = busy;
+    g_wheelBusySnapshot.store(busy, std::memory_order_release);
+}
 
-    g_configPath.assign(executablePath, length);
-    const size_t separator = g_configPath.find_last_of(L"\\/");
-    if (separator == std::wstring::npos) {
-        g_configPath.clear();
+void LoadWheelTiming() {
+    InitializeConfigPath();
+    if (g_configPath.empty()) {
         Log("No se pudo localizar MH3WorldControls.ini; se usaran los tiempos seguros por defecto.");
         return;
     }
-    g_configPath.resize(separator + 1);
-    g_configPath += L"MH3WorldControls.ini";
 
     const auto readSetting = [](const wchar_t* name, DWORD defaultValue,
                                 DWORD minimum, DWORD maximum) {
@@ -162,6 +477,9 @@ void LoadWheelTiming() {
     g_wheelTiming.stepIntervalMs = readSetting(L"step_interval_ms", 150, 100, 600);
     g_wheelTiming.stepIntervalMs = std::max(g_wheelTiming.stepIntervalMs, g_wheelTiming.pulseMs);
     g_wheelTiming.releaseDelayMs = readSetting(L"release_delay_ms", 550, 550, 1000);
+    g_wheelTiming.wheelSensitivityPercent = readSetting(L"sensitivity_percent", 100, 50, 200);
+    g_wheelTiming.invertWheel = GetPrivateProfileIntW(L"Wheel", L"invert", 0,
+                                                       g_configPath.c_str()) != 0;
     const UINT rawPreopenThreshold = GetPrivateProfileIntW(L"Wheel", L"preopen_threshold", 60,
                                                             g_configPath.c_str());
     g_wheelTiming.preopenThreshold = std::min<DWORD>(rawPreopenThreshold, WHEEL_DELTA - 1);
@@ -189,6 +507,86 @@ void LoadWheelTiming() {
         GetPrivateProfileIntW(L"Controller", L"gather_interval_ms", 300, g_configPath.c_str()), 200, 1000);
     g_wheelTiming.gatherIntervalMs = std::max(g_wheelTiming.gatherIntervalMs,
                                               g_wheelTiming.gatherPulseMs);
+
+    wchar_t controllerIndex[16]{};
+    GetPrivateProfileStringW(L"Controller", L"gather_controller", L"any", controllerIndex,
+                              static_cast<DWORD>(std::size(controllerIndex)), g_configPath.c_str());
+    if (CompareStringOrdinal(controllerIndex, -1, L"any", -1, TRUE) == CSTR_EQUAL) {
+        g_gatherControllerIndex.store(-1, std::memory_order_release);
+    } else {
+        wchar_t* end = nullptr;
+        const long parsedIndex = std::wcstol(controllerIndex, &end, 10);
+        g_gatherControllerIndex.store(end != controllerIndex && *end == L'\0' &&
+                                      parsedIndex >= 0 && parsedIndex < XUSER_MAX_COUNT
+                                          ? static_cast<int>(parsedIndex) : -1,
+                                      std::memory_order_release);
+    }
+    g_controllerNotificationsEnabled.store(
+        GetPrivateProfileIntW(L"Controller", L"connection_notifications", 1,
+                              g_configPath.c_str()) != 0,
+        std::memory_order_release);
+
+    wchar_t extraKeysText[256]{};
+    GetPrivateProfileStringW(L"Input", L"extra_guard_keys", L"", extraKeysText,
+                              static_cast<DWORD>(std::size(extraKeysText)), g_configPath.c_str());
+    std::array<int, kMaxExtraGuardKeys> extraKeys{};
+    DWORD extraKeyCount = 0;
+    if (ParseExtraGuardKeys(extraKeysText, extraKeys, extraKeyCount)) {
+        ApplyExtraGuardKeys(extraKeys, extraKeyCount);
+        g_extraGuardKeysText = extraKeysText;
+    } else {
+        ApplyExtraGuardKeys({}, 0);
+        g_extraGuardKeysText.clear();
+        Log("Input.extra_guard_keys invalido; se ignoraran las teclas adicionales.");
+    }
+}
+
+void AppendDiagnosticLog(const std::wstring& message) {
+    if (g_configPath.empty())
+        return;
+    const size_t separator = g_configPath.find_last_of(L"\\/");
+    if (separator == std::wstring::npos)
+        return;
+    const std::wstring logPath = g_configPath.substr(0, separator) +
+                                 L"\\MH3WorldControls.log";
+    const std::wstring backupPath = logPath + L".1";
+
+    std::lock_guard<std::mutex> lock(g_fileLogMutex);
+    HANDLE file = CreateFileW(logPath.c_str(), FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 512 * 1024) {
+        CloseHandle(file);
+        MoveFileExW(logPath.c_str(), backupPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        file = CreateFileW(logPath.c_str(), FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return;
+        size.QuadPart = 0;
+        GetFileSizeEx(file, &size);
+    }
+
+    DWORD written = 0;
+    if (size.QuadPart == 0) {
+        constexpr wchar_t bom = 0xFEFF;
+        WriteFile(file, &bom, sizeof(bom), &written, nullptr);
+    }
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t prefix[48]{};
+    swprintf_s(prefix, L"[%04u-%02u-%02u %02u:%02u:%02u] ",
+               now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    std::wstring line = prefix;
+    line += message;
+    line += L"\r\n";
+    const DWORD byteCount = static_cast<DWORD>(line.size() * sizeof(wchar_t));
+    WriteFile(file, line.data(), byteCount, &written, nullptr);
+    CloseHandle(file);
 }
 
 void Log(const std::string& message) {
@@ -197,6 +595,7 @@ void Log(const std::string& message) {
         std::lock_guard<std::mutex> lock(g_statusMutex);
         g_latestLog.assign(message.begin(), message.end());
     }
+    AppendDiagnosticLog(std::wstring(message.begin(), message.end()));
     if (g_mainWindow != nullptr)
         PostMessageW(g_mainWindow, kUiStatusMessage, 0, 0);
 }
@@ -384,6 +783,7 @@ XInputHeldActions ReadXInputHeldActions() {
                                    XINPUT_GAMEPAD_LEFT_THUMB |
                                    XINPUT_GAMEPAD_RIGHT_THUMB;
     const WORD gatherButton = g_controllerGatherButton.load(std::memory_order_acquire);
+    const int gatherController = g_gatherControllerIndex.load(std::memory_order_acquire);
     for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex) {
         // Keep connected pads responsive at the worker's normal rate, but avoid
         // polling empty XInput slots every 5 ms. Discover new pads every 2 s.
@@ -405,7 +805,9 @@ XInputHeldActions ReadXInputHeldActions() {
             (rightShoulderHeld && !moving) || pad.bRightTrigger >= 32) {
             held.gameplayAction = true;
         }
-        if (gatherButton != 0 && (pad.wButtons & gatherButton) != 0) {
+        if (gatherButton != 0 && (gatherController < 0 ||
+                                  gatherController == static_cast<int>(userIndex)) &&
+            (pad.wButtons & gatherButton) != 0) {
             held.pickupButton = true;
         }
     }
@@ -430,6 +832,14 @@ bool IsAnyGameplayActionPhysicallyHeld() {
     constexpr int kActionKeys[] = {VK_SPACE, VK_BACK, 'Z', 'C'};
     for (int key : kActionKeys) {
         if ((GetAsyncKeyState(key) & 0x8000) != 0)
+            return true;
+    }
+    const DWORD extraKeyCount = std::min<DWORD>(
+        g_extraGuardKeyCount.load(std::memory_order_acquire),
+        static_cast<DWORD>(kMaxExtraGuardKeys));
+    for (DWORD index = 0; index < extraKeyCount; ++index) {
+        const int key = g_extraGuardKeys[index].load(std::memory_order_acquire);
+        if (key != 0 && (GetAsyncKeyState(key) & 0x8000) != 0)
             return true;
     }
     const bool runningHeld = (GetAsyncKeyState('R') & 0x8000) != 0 ||
@@ -459,7 +869,9 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM message, LPARAM data) {
         if (!injected && (key->vkCode == 'F' || key->vkCode == 'Q' || key->vkCode == 'E')) {
             const bool keyUp = message == WM_KEYUP || message == WM_SYSKEYUP;
             if (keyDown || keyUp) {
-                const bool gameFocused = IsGameForeground();
+                // This path runs inside the low-level hook callback. Use the cached
+                // process identity check; do not open/query a process from the hook.
+                const bool gameFocused = IsKnownGameForeground();
                 if (key->vkCode == 'F') {
                     g_pickupHeld.store(keyDown && gameFocused, std::memory_order_release);
                 } else if (key->vkCode == 'E') {
@@ -467,11 +879,11 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM message, LPARAM data) {
                     // key-up can never be mistaken for the player's charge release.
                     g_physicalYHeld.store(keyDown, std::memory_order_release);
                 } else {
-                    std::lock_guard<std::mutex> lock(g_wheelMutex);
                     g_itemKeyHeld.store(keyDown && gameFocused, std::memory_order_release);
                     if (keyDown) {
                         g_deferredItemKeyRelease = false;
-                    } else if (gameFocused && g_wheelBusy) {
+                    } else if (gameFocused &&
+                               g_wheelBusySnapshot.load(std::memory_order_acquire)) {
                         // Keep L held until queued wheel steps finish, even if the
                         // player releases Q quickly after scrolling.
                         g_deferredItemKeyRelease = true;
@@ -542,11 +954,11 @@ bool DiscardPendingWheelInputLocked(bool force) {
     const bool deferredRelease = g_deferredItemKeyRelease;
     if (modifierWasInjected || deferredRelease) {
         // Let an already-open bar close safely. Do not preserve any item steps.
-        g_wheelBusy = true;
+        SetWheelBusyLocked(true);
         const ULONGLONG delay = modifierWasInjected ? timing.releaseDelayMs : 0;
         g_wheelReleaseAt.store(GetTickCount64() + delay, std::memory_order_release);
     } else {
-        g_wheelBusy = false;
+        SetWheelBusyLocked(false);
         g_wheelReleaseAt.store(0, std::memory_order_release);
     }
     return true;
@@ -561,8 +973,7 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
     if (delta == 0 || !g_wheelEnabled.load(std::memory_order_acquire) || !IsGameForeground())
         return;
 
-    if (actionHeldAtScroll || IsAnyGameplayActionPhysicallyHeld() ||
-        ReadXInputHeldActions().gameplayAction) {
+    if (actionHeldAtScroll || IsAnyGameplayActionPhysicallyHeld()) {
         // Scrolling during a charge is ignored, never queued for after the attack.
         DiscardPendingWheelInput(true);
         return;
@@ -574,8 +985,12 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
     bool injectModifier = false;
     {
         std::lock_guard<std::mutex> lock(g_wheelMutex);
-        g_pendingWheelDelta += delta;
-        while (std::abs(g_pendingWheelDelta) >= WHEEL_DELTA) {
+        int64_t scaledDelta = static_cast<int64_t>(delta) * timing.wheelSensitivityPercent;
+        if (timing.invertWheel)
+            scaledDelta = -scaledDelta;
+        g_pendingWheelDelta += scaledDelta;
+        while (g_pendingWheelDelta >= kScaledWheelNotch ||
+               g_pendingWheelDelta <= -kScaledWheelNotch) {
             const bool scrollUp = g_pendingWheelDelta > 0;
             const WORD direction = scrollUp ? 'E' : kMouseRightAction;
             // The item window uses L + Y/A. E maps to Y; right mouse maps to A.
@@ -586,27 +1001,35 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
             } else if (g_wheelDirections.size() < 8) {
                 g_wheelDirections.push_back(direction);
             } else {
+                const uint64_t pendingMagnitude = static_cast<uint64_t>(
+                    g_pendingWheelDelta >= 0 ? g_pendingWheelDelta : -g_pendingWheelDelta);
+                const DWORD dropped = static_cast<DWORD>(std::max<uint64_t>(
+                    1, pendingMagnitude / static_cast<uint64_t>(kScaledWheelNotch)));
+                g_droppedWheelSteps.fetch_add(dropped, std::memory_order_relaxed);
                 g_pendingWheelDelta = 0;
                 break;
             }
-            g_pendingWheelDelta += scrollUp ? -WHEEL_DELTA : WHEEL_DELTA;
+            g_pendingWheelDelta += scrollUp ? -kScaledWheelNotch : kScaledWheelNotch;
         }
         queuedSelection = !g_wheelDirections.empty();
         if (queuedSelection)
-            g_wheelBusy = true;
-        if (g_wheelDirections.size() >= 8 && std::abs(g_pendingWheelDelta) >= WHEEL_DELTA)
+            SetWheelBusyLocked(true);
+        if (g_wheelDirections.size() >= 8 &&
+            (g_pendingWheelDelta >= kScaledWheelNotch ||
+             g_pendingWheelDelta <= -kScaledWheelNotch))
             g_pendingWheelDelta = 0;
         const bool preopenPartial = timing.preopenThreshold > 0 &&
-                                    std::abs(g_pendingWheelDelta) >= int(timing.preopenThreshold);
+            (g_pendingWheelDelta >= int64_t(timing.preopenThreshold) * kWheelDeltaScale ||
+             g_pendingWheelDelta <= -int64_t(timing.preopenThreshold) * kWheelDeltaScale);
         if (queuedSelection || preopenPartial)
-            g_wheelBusy = true;
+            SetWheelBusyLocked(true);
         if (!queuedSelection && !preopenPartial &&
             g_wheelModifierPending.load(std::memory_order_acquire) &&
             !g_wheelModifierInjected.load(std::memory_order_acquire) &&
             !g_deferredItemKeyRelease) {
             // The net wheel movement returned to zero before Q was sent.
             g_wheelModifierPending.store(false, std::memory_order_release);
-            g_wheelBusy = false;
+            SetWheelBusyLocked(false);
             g_wheelReadyAt.store(0, std::memory_order_release);
             g_wheelReleaseAt.store(0, std::memory_order_release);
         }
@@ -649,8 +1072,9 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
             std::lock_guard<std::mutex> lock(g_wheelMutex);
             g_wheelDirections.clear();
             g_pendingWheelDelta = 0;
-            g_wheelBusy = false;
-            const bool deferredRelease = std::exchange(g_deferredItemKeyRelease, false);
+            SetWheelBusyLocked(false);
+            const bool deferredRelease = g_deferredItemKeyRelease.exchange(false,
+                std::memory_order_acq_rel);
             g_wheelModifierInjected.store(false, std::memory_order_release);
             g_wheelModifierPending.store(false, std::memory_order_release);
             g_wheelReleaseAt.store(0, std::memory_order_release);
@@ -661,13 +1085,21 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
     }
 }
 
-bool ReleaseWheelModifier(bool force) {
+bool ReleaseWheelModifier() {
     const bool gameFocused = IsGameForeground();
     std::lock_guard<std::mutex> lock(g_wheelMutex);
     const bool modifierWasInjected = g_wheelModifierInjected.exchange(false, std::memory_order_acq_rel);
+    const bool deferredRelease = g_deferredItemKeyRelease.exchange(false,
+        std::memory_order_acq_rel);
     g_wheelModifierPending.store(false, std::memory_order_release);
-    const bool sendRelease = gameFocused && modifierWasInjected &&
-                             (force || !g_itemKeyHeld.load(std::memory_order_acquire));
+    SetWheelBusyLocked(false);
+    g_wheelDirections.clear();
+    g_pendingWheelDelta = 0;
+    g_wheelReleaseAt.store(0, std::memory_order_release);
+    g_wheelReadyAt.store(0, std::memory_order_release);
+    // Never inject Q-up over a physical Q hold, even during shutdown.
+    const bool sendRelease = gameFocused && (modifierWasInjected || deferredRelease) &&
+                             !g_itemKeyHeld.load(std::memory_order_acquire);
     if (sendRelease)
         SendKey('Q', false);
     g_wheelReadyAt.store(0, std::memory_order_release);
@@ -683,6 +1115,7 @@ void PickupWorker() {
     auto releasePickup = Clock::time_point::min();
     auto nextWheelPress = Clock::time_point::min();
     auto releaseWheelArrow = Clock::time_point::min();
+    auto nextIdleControllerPoll = Clock::time_point::min();
     bool lastGameFocused = false;
     bool reportedPickupHeld = false;
 
@@ -690,8 +1123,13 @@ void PickupWorker() {
         const auto now = Clock::now();
         const WheelTiming timing = GetWheelTiming();
         const bool gameFocused = IsGameForeground();
-        const XInputHeldActions xinput = gameFocused ? ReadXInputHeldActions() : XInputHeldActions{};
-        g_controllerActionHeld.store(xinput.gameplayAction,
+        XInputHeldActions xinput{};
+        if (gameFocused || now >= nextIdleControllerPoll) {
+            xinput = ReadXInputHeldActions();
+            nextIdleControllerPoll = now + (gameFocused ? std::chrono::milliseconds(5)
+                                                        : std::chrono::milliseconds(250));
+        }
+        g_controllerActionHeld.store(gameFocused && xinput.gameplayAction,
                                      std::memory_order_release);
         const bool pickupHeld = gameFocused &&
                                 (g_pickupHeld.load(std::memory_order_acquire) ||
@@ -711,7 +1149,7 @@ void PickupWorker() {
                 std::lock_guard<std::mutex> lock(g_wheelMutex);
                 g_wheelDirections.clear();
                 g_pendingWheelDelta = 0;
-                g_wheelBusy = false;
+                SetWheelBusyLocked(false);
                 g_deferredItemKeyRelease = false;
                 g_wheelModifierInjected.store(false, std::memory_order_release);
                 g_wheelModifierPending.store(false, std::memory_order_release);
@@ -765,8 +1203,9 @@ void PickupWorker() {
                     std::lock_guard<std::mutex> lock(g_wheelMutex);
                     g_wheelDirections.clear();
                     g_pendingWheelDelta = 0;
-                    g_wheelBusy = false;
-                    const bool deferredRelease = std::exchange(g_deferredItemKeyRelease, false);
+                    SetWheelBusyLocked(false);
+                    const bool deferredRelease = g_deferredItemKeyRelease.exchange(false,
+                        std::memory_order_acq_rel);
                     g_wheelModifierInjected.store(false, std::memory_order_release);
                     g_wheelModifierPending.store(false, std::memory_order_release);
                     g_wheelReleaseAt.store(0, std::memory_order_release);
@@ -814,11 +1253,12 @@ void PickupWorker() {
                             // Fail closed: never emit Y/A if L is no longer held.
                             g_wheelDirections.clear();
                             g_pendingWheelDelta = 0;
-                            g_wheelBusy = false;
+                            SetWheelBusyLocked(false);
                             g_wheelReleaseAt.store(0, std::memory_order_release);
                             g_wheelReadyAt.store(0, std::memory_order_release);
                             discardedUnsafeQueue = true;
-                            if (std::exchange(g_deferredItemKeyRelease, false) && IsGameForeground())
+                            if (g_deferredItemKeyRelease.exchange(false, std::memory_order_acq_rel) &&
+                                IsGameForeground())
                                 SendKey('Q', false);
                         }
                     }
@@ -854,8 +1294,9 @@ void PickupWorker() {
                             g_wheelModifierInjected.exchange(false, std::memory_order_acq_rel);
                         const bool physicalModifierHeld = g_itemKeyHeld.load(std::memory_order_acquire);
                         g_wheelModifierPending.store(false, std::memory_order_release);
-                        deferredRelease = std::exchange(g_deferredItemKeyRelease, false);
-                        g_wheelBusy = false;
+                        deferredRelease = g_deferredItemKeyRelease.exchange(false,
+                            std::memory_order_acq_rel);
+                        SetWheelBusyLocked(false);
                         g_wheelReleaseAt.store(0, std::memory_order_release);
                         g_wheelReadyAt.store(0, std::memory_order_release);
                         // Serialize Q-up with wheel enqueue so a fresh scroll cannot
@@ -905,7 +1346,7 @@ void PickupWorker() {
             SendKey(activeWheelKey, false);
         }
     }
-    ReleaseWheelModifier(true);
+    ReleaseWheelModifier();
 }
 
 constexpr COLORREF kUiBackground = RGB(7, 17, 32);
@@ -1007,12 +1448,17 @@ void NotifyControllerChange(bool connected, DWORD count) {
                              : L"Quedan mandos XInput conectados.";
     }
 
+    const std::wstring notificationLog = title + L": " + message;
     {
         std::lock_guard<std::mutex> lock(g_statusMutex);
-        g_latestLog = title + L": " + message;
+        g_latestLog = notificationLog;
     }
+    AppendDiagnosticLog(notificationLog);
     if (g_mainWindow != nullptr)
         PostMessageW(g_mainWindow, kUiStatusMessage, 0, 0);
+
+    if (!g_controllerNotificationsEnabled.load(std::memory_order_acquire))
+        return;
 
     if (g_trayIconAdded) {
         NOTIFYICONDATAW notification = g_trayIconData;
@@ -1026,7 +1472,6 @@ void NotifyControllerChange(bool connected, DWORD count) {
 }
 
 void CheckControllerConnectionChange() {
-    ReadXInputHeldActions();
     const DWORD currentMask = g_connectedControllerMask.load(std::memory_order_acquire);
     const DWORD currentCount = g_connectedControllerCount.load(std::memory_order_acquire);
     if (!g_controllerStateInitialized) {
@@ -1052,6 +1497,110 @@ void ShowMainWindow(HWND window) {
     SetForegroundWindow(window);
 }
 
+void CopyDiagnostics(HWND owner) {
+    const WheelTiming timing = GetWheelTiming();
+    DWORD pendingSteps = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_wheelMutex);
+        pendingSteps = static_cast<DWORD>(g_wheelDirections.size());
+    }
+    const DWORD controllerMask = g_connectedControllerMask.load(std::memory_order_acquire);
+    const WORD gatherButtonMask = g_controllerGatherButton.load(std::memory_order_acquire);
+    const wchar_t* gatherButton = gatherButtonMask == XINPUT_GAMEPAD_A ? L"A" :
+                                  gatherButtonMask == XINPUT_GAMEPAD_B ? L"B / Circle" :
+                                  gatherButtonMask == XINPUT_GAMEPAD_X ? L"X" :
+                                  gatherButtonMask == XINPUT_GAMEPAD_Y ? L"Y" : L"Off";
+    std::wstring latestLog;
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        latestLog = g_latestLog;
+    }
+
+    std::wstring report = L"MH3 World Controls " + std::wstring(kAppVersion);
+    report += L"\r\nGame focused: ";
+    report += IsGameForeground() ? L"yes" : L"no";
+    report += L"\r\nWheel: ";
+    report += g_wheelEnabled.load(std::memory_order_acquire) ? L"enabled" : L"paused";
+    report += L"; sensitivity=" + std::to_wstring(timing.wheelSensitivityPercent) + L"%";
+    report += timing.invertWheel ? L"; inverted" : L"; normal direction";
+    report += L"; interval=" + std::to_wstring(timing.stepIntervalMs) + L"ms";
+    report += L"; queued=" + std::to_wstring(pendingSteps);
+    report += L"; dropped=" + std::to_wstring(g_droppedWheelSteps.load(std::memory_order_relaxed));
+    report += L"\r\nController backend: ";
+    report += g_xinputGetState != nullptr ? L"XInput" : L"unavailable";
+    report += L"; connected=" + std::to_wstring(
+        g_connectedControllerCount.load(std::memory_order_acquire));
+    report += L"; slot mask=0x";
+    wchar_t maskText[16]{};
+    swprintf_s(maskText, L"%lX", static_cast<unsigned long>(controllerMask));
+    report += maskText;
+    report += L"; gather button=";
+    report += gatherButton;
+    const int selectedController = g_gatherControllerIndex.load(std::memory_order_acquire);
+    report += L"; gather controller=";
+    report += selectedController < 0 ? L"any" : std::to_wstring(selectedController + 1);
+    report += L"; connection notifications=";
+    report += g_controllerNotificationsEnabled.load(std::memory_order_acquire) ? L"on" : L"off";
+    report += L"\r\nHooks: keyboard=";
+    report += g_keyboardHook != nullptr ? L"active" : L"inactive";
+    report += L"; mouse=";
+    report += g_mouseHook != nullptr ? L"active" : L"inactive";
+    report += L"\r\nConfig file: ";
+    report += !g_configPath.empty() && GetFileAttributesW(g_configPath.c_str()) != INVALID_FILE_ATTRIBUTES
+                  ? L"present" : L"missing";
+    const size_t configSeparator = g_configPath.find_last_of(L"\\/");
+    const std::wstring logPath = configSeparator == std::wstring::npos
+                                     ? std::wstring{}
+                                     : g_configPath.substr(0, configSeparator) +
+                                           L"\\MH3WorldControls.log";
+    report += L"; rolling log=";
+    report += !logPath.empty() && GetFileAttributesW(logPath.c_str()) != INVALID_FILE_ATTRIBUTES
+                  ? L"present" : L"not created";
+    report += L"\r\nLatest status: ";
+    report += latestLog.empty() ? L"none" : latestLog;
+    report += L"\r\n";
+
+    if (!OpenClipboard(owner)) {
+        MessageBoxW(owner, L"No se pudo abrir el portapapeles.", L"Diagnóstico",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (!EmptyClipboard()) {
+        CloseClipboard();
+        MessageBoxW(owner, L"No se pudo limpiar el portapapeles.", L"Diagnóstico",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const SIZE_T byteCount = (report.size() + 1) * sizeof(wchar_t);
+    HGLOBAL clipboardData = GlobalAlloc(GMEM_MOVEABLE, byteCount);
+    if (clipboardData == nullptr) {
+        CloseClipboard();
+        MessageBoxW(owner, L"No hay memoria suficiente para copiar el diagnóstico.",
+                    L"Diagnóstico", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    auto* clipboardText = static_cast<wchar_t*>(GlobalLock(clipboardData));
+    if (clipboardText == nullptr) {
+        GlobalFree(clipboardData);
+        CloseClipboard();
+        MessageBoxW(owner, L"No se pudo preparar el diagnóstico.", L"Diagnóstico",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    std::copy(report.begin(), report.end(), clipboardText);
+    clipboardText[report.size()] = L'\0';
+    GlobalUnlock(clipboardData);
+    if (SetClipboardData(CF_UNICODETEXT, clipboardData) == nullptr) {
+        GlobalFree(clipboardData);
+        CloseClipboard();
+        MessageBoxW(owner, L"Windows no pudo copiar el diagnóstico.", L"Diagnóstico",
+                    MB_OK | MB_ICONWARNING);
+        return;
+    }
+    CloseClipboard();
+    Log("Diagnostico copiado al portapapeles.");
+}
+
 void ShowTrayMenu(HWND window) {
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr)
@@ -1061,6 +1610,7 @@ void ShowTrayMenu(HWND window) {
     AppendMenuW(menu, MF_STRING, kTraySettings, L"Configuración");
     AppendMenuW(menu, MF_STRING, kTrayToggleWheel,
                 g_wheelEnabled.load(std::memory_order_acquire) ? L"Pausar rueda" : L"Reactivar rueda");
+    AppendMenuW(menu, MF_STRING, kTrayCopyDiagnostics, L"Copiar diagnóstico");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kTrayExit, L"Cerrar helper");
 
@@ -1082,6 +1632,9 @@ void ShowTrayMenu(HWND window) {
     case kTrayToggleWheel:
         ToggleWheel();
         break;
+    case kTrayCopyDiagnostics:
+        CopyDiagnostics(window);
+        break;
     case kTrayExit:
         PostMessageW(window, WM_CLOSE, 0, 0);
         break;
@@ -1095,14 +1648,16 @@ void DrawMainWindow(HDC dc, const RECT& client) {
     DeleteObject(background);
 
     RECT title{30, 22, client.right - 30, 58};
-    DrawUiText(dc, L"MH3 WORLD CONTROLS", title, kUiText, g_uiBoldFont);
+    DrawUiText(dc, L"MH3 WORLD CONTROLS", title, kUiText, g_uiPaintBoldFont);
     RECT subtitle{31, 58, client.right - 30, 82};
-    DrawUiText(dc, L"Controles de calidad de vida para OceanTriRecomp", subtitle, kUiMuted, g_uiFont);
+    const std::wstring subtitleText = L"Controles de calidad de vida para OceanTriRecomp · v" +
+                                      std::wstring(kAppVersion);
+    DrawUiText(dc, subtitleText.c_str(), subtitle, kUiMuted, g_uiPaintFont);
 
     RECT gameCard{25, 98, client.right - 25, 213};
     DrawUiCard(dc, gameCard, kUiPanelRaised);
     RECT section{45, 111, client.right - 45, 135};
-    DrawUiText(dc, L"ESTADO DEL JUEGO", section, kUiCyan, g_uiBoldFont);
+    DrawUiText(dc, L"ESTADO DEL JUEGO", section, kUiCyan, g_uiPaintBoldFont);
 
     const bool gameFocused = IsGameForeground();
     const COLORREF gameColor = gameFocused ? kUiGreen : kUiAmber;
@@ -1113,10 +1668,10 @@ void DrawMainWindow(HDC dc, const RECT& client) {
     RECT gameStatus{70, 144, client.right - 48, 173};
     DrawUiText(dc, gameFocused ? L"OceanTriRecomp está en primer plano" :
                                  L"Abre OceanTriRecomp para activar los controles",
-               gameStatus, gameFocused ? kUiGreen : kUiText, g_uiBoldFont);
+               gameStatus, gameFocused ? kUiGreen : kUiText, g_uiPaintBoldFont);
     RECT gameHint{70, 176, client.right - 48, 198};
     DrawUiText(dc, L"El helper solo envía controles cuando el juego tiene el foco.",
-               gameHint, kUiMuted, g_uiFont);
+                gameHint, kUiMuted, g_uiPaintFont);
 
     const int middle = client.right / 2;
     RECT wheelCard{25, 228, middle - 8, 337};
@@ -1125,16 +1680,26 @@ void DrawMainWindow(HDC dc, const RECT& client) {
     DrawUiCard(dc, controllerCard);
 
     RECT wheelTitle{43, 241, middle - 20, 263};
-    DrawUiText(dc, L"CAMBIO CON RUEDA", wheelTitle, kUiCyan, g_uiBoldFont);
+    DrawUiText(dc, L"CAMBIO CON RUEDA", wheelTitle, kUiCyan, g_uiPaintBoldFont);
     RECT wheelState{43, 271, middle - 20, 296};
     const bool wheelEnabled = g_wheelEnabled.load(std::memory_order_acquire);
     DrawUiText(dc, wheelEnabled ? L"Activo" : L"Pausado", wheelState,
-               wheelEnabled ? kUiGreen : kUiAmber, g_uiBoldFont);
+               wheelEnabled ? kUiGreen : kUiAmber, g_uiPaintBoldFont);
     RECT wheelDetail{43, 303, middle - 20, 326};
-    DrawUiText(dc, L"F8 alterna · paso controlado", wheelDetail, kUiMuted, g_uiFont);
+    wchar_t wheelText[128]{};
+    DWORD pendingSteps = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_wheelMutex);
+        pendingSteps = static_cast<DWORD>(g_wheelDirections.size());
+    }
+    swprintf_s(wheelText, L"%lu%% · cola %lu · perdidos %lu",
+               static_cast<unsigned long>(timing.wheelSensitivityPercent),
+               static_cast<unsigned long>(pendingSteps),
+               static_cast<unsigned long>(g_droppedWheelSteps.load(std::memory_order_relaxed)));
+    DrawUiText(dc, wheelText, wheelDetail, kUiMuted, g_uiPaintFont);
 
     RECT controllerTitle{middle + 26, 241, client.right - 42, 263};
-    DrawUiText(dc, L"MANDO Y RECOLECCIÓN", controllerTitle, kUiCyan, g_uiBoldFont);
+    DrawUiText(dc, L"MANDO Y RECOLECCIÓN", controllerTitle, kUiCyan, g_uiPaintBoldFont);
     RECT controllerState{middle + 26, 271, client.right - 42, 296};
     const DWORD controllerCount = g_connectedControllerCount.load(std::memory_order_acquire);
     wchar_t controllerText[80]{};
@@ -1146,7 +1711,7 @@ void DrawMainWindow(HDC dc, const RECT& client) {
         swprintf_s(controllerText, L"%lu mando(s) XInput conectado(s)",
                    static_cast<unsigned long>(controllerCount));
     DrawUiText(dc, controllerText, controllerState,
-               controllerCount > 0 ? kUiGreen : kUiText, g_uiBoldFont);
+                controllerCount > 0 ? kUiGreen : kUiText, g_uiPaintBoldFont);
     RECT controllerDetail{middle + 26, 303, client.right - 42, 326};
     wchar_t gatherDetail[128]{};
     const WORD gatherButtonMask = g_controllerGatherButton.load(std::memory_order_acquire);
@@ -1154,24 +1719,29 @@ void DrawMainWindow(HDC dc, const RECT& client) {
                                   gatherButtonMask == XINPUT_GAMEPAD_B ? L"B / Círculo" :
                                   gatherButtonMask == XINPUT_GAMEPAD_X ? L"X" :
                                   gatherButtonMask == XINPUT_GAMEPAD_Y ? L"Y" : L"Desactivada";
-    swprintf_s(gatherDetail, L"%s · cada %lu ms", gatherButton,
+    const int selectedController = g_gatherControllerIndex.load(std::memory_order_acquire);
+    swprintf_s(gatherDetail, L"%s · %s · cada %lu ms", gatherButton,
+               selectedController < 0 ? L"cualquiera" :
+                   (selectedController == 0 ? L"mando 1" : selectedController == 1 ? L"mando 2" :
+                    selectedController == 2 ? L"mando 3" : L"mando 4"),
                static_cast<unsigned long>(timing.gatherIntervalMs));
-    DrawUiText(dc, gatherDetail, controllerDetail, kUiMuted, g_uiFont);
+    DrawUiText(dc, gatherDetail, controllerDetail, kUiMuted, g_uiPaintFont);
 
     RECT settingsCard{25, 352, client.right - 25, 433};
     DrawUiCard(dc, settingsCard);
     RECT settingsTitle{44, 364, client.right - 44, 387};
-    DrawUiText(dc, L"AJUSTES", settingsTitle, kUiCyan, g_uiBoldFont);
+    DrawUiText(dc, L"AJUSTES", settingsTitle, kUiCyan, g_uiPaintBoldFont);
     RECT settingsDetail{44, 390, client.right - 44, 410};
     wchar_t settingsText[160]{};
     swprintf_s(settingsText, L"Rueda: %lu ms por paso  ·  Recolección: pulso %lu ms / intervalo %lu ms",
                static_cast<unsigned long>(timing.stepIntervalMs),
                static_cast<unsigned long>(timing.gatherPulseMs),
                static_cast<unsigned long>(timing.gatherIntervalMs));
-    DrawUiText(dc, settingsText, settingsDetail, kUiText, g_uiFont);
+    DrawUiText(dc, settingsText, settingsDetail, kUiText, g_uiPaintFont);
     RECT settingsHint{44, 411, client.right - 44, 429};
-    DrawUiText(dc, L"La ventana de configuración guarda y aplica los cambios al instante.",
-               settingsHint, kUiMuted, g_uiFont);
+    DrawUiText(dc, timing.invertWheel ? L"Scroll invertido · Configuración guarda y aplica al instante." :
+                                        L"Scroll normal · Configuración guarda y aplica al instante.",
+               settingsHint, kUiMuted, g_uiPaintFont);
 
     std::wstring latestLog;
     {
@@ -1181,13 +1751,14 @@ void DrawMainWindow(HDC dc, const RECT& client) {
     RECT footer{29, client.bottom - 31, client.right - 29, client.bottom - 8};
     if (latestLog.empty())
         latestLog = L"Mantén F o B/Círculo para recolectar · F9 cierra el helper";
-    DrawUiText(dc, latestLog.c_str(), footer, kUiMuted, g_uiFont,
+    DrawUiText(dc, latestLog.c_str(), footer, kUiMuted, g_uiPaintFont,
                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
-void CreateSettingsLabel(HWND window, const wchar_t* text, int y) {
+void CreateSettingsLabel(HWND window, const wchar_t* text, int y,
+                         int x = 42, int width = 295) {
     const HWND label = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-        42, y, 295, 26, window, nullptr, nullptr, nullptr);
+        ScaleUi(x), ScaleUi(y), ScaleUi(width), ScaleUi(26), window, nullptr, nullptr, nullptr);
     if (label != nullptr)
         SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 }
@@ -1197,7 +1768,7 @@ HWND CreateSettingsEdit(HWND window, int id, int y, DWORD value,
     const std::wstring text = std::to_wstring(value);
     const HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text.c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
-        356, y, 112, 27, window,
+        ScaleUi(356), ScaleUi(y), ScaleUi(112), ScaleUi(27), window,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
     if (edit == nullptr)
         return nullptr;
@@ -1205,7 +1776,7 @@ HWND CreateSettingsEdit(HWND window, int id, int y, DWORD value,
 
     HWND spinner = CreateWindowExW(0, UPDOWN_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_SETBUDDYINT,
-        0, y, 0, 0, window,
+        0, ScaleUi(y), 0, 0, window,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id + 100)), nullptr, nullptr);
     if (spinner == nullptr) {
         DestroyWindow(edit);
@@ -1216,14 +1787,31 @@ HWND CreateSettingsEdit(HWND window, int id, int y, DWORD value,
     return spinner;
 }
 
+HWND CreateSettingsTextInput(HWND window, int id, int y, const wchar_t* value) {
+    HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", value,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        ScaleUi(220), ScaleUi(y), ScaleUi(248), ScaleUi(27), window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
+    if (edit != nullptr) {
+        SendMessageW(edit, EM_SETLIMITTEXT, 120, 0);
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+    }
+    return edit;
+}
+
 void SetSettingsDefaults(HWND window) {
     SetDlgItemInt(window, kSettingsWheelInitialDelay, 300, FALSE);
     SetDlgItemInt(window, kSettingsWheelPulse, 50, FALSE);
     SetDlgItemInt(window, kSettingsWheelStep, 150, FALSE);
     SetDlgItemInt(window, kSettingsWheelRelease, 550, FALSE);
     SetDlgItemInt(window, kSettingsPreopenThreshold, 60, FALSE);
+    SetDlgItemInt(window, kSettingsWheelSensitivity, 100, FALSE);
+    SendDlgItemMessageW(window, kSettingsWheelInvert, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendDlgItemMessageW(window, kSettingsControllerNotifications, BM_SETCHECK, BST_CHECKED, 0);
+    SetDlgItemTextW(window, kSettingsExtraGuardKeys, L"");
     SendDlgItemMessageW(window, kSettingsWheelPreset, CB_SETCURSEL, 2, 0);
     SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, 0, 0);
+    SendDlgItemMessageW(window, kSettingsGatherController, CB_SETCURSEL, 0, 0);
     SetDlgItemInt(window, kSettingsGatherPulse, 60, FALSE);
     SetDlgItemInt(window, kSettingsGatherInterval, 300, FALSE);
 }
@@ -1235,6 +1823,13 @@ void PopulateSettings(HWND window) {
     SetDlgItemInt(window, kSettingsWheelStep, timing.stepIntervalMs, FALSE);
     SetDlgItemInt(window, kSettingsWheelRelease, timing.releaseDelayMs, FALSE);
     SetDlgItemInt(window, kSettingsPreopenThreshold, timing.preopenThreshold, FALSE);
+    SetDlgItemInt(window, kSettingsWheelSensitivity, timing.wheelSensitivityPercent, FALSE);
+    SendDlgItemMessageW(window, kSettingsWheelInvert, BM_SETCHECK,
+                        timing.invertWheel ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendDlgItemMessageW(window, kSettingsControllerNotifications, BM_SETCHECK,
+        g_controllerNotificationsEnabled.load(std::memory_order_acquire) ? BST_CHECKED : BST_UNCHECKED,
+        0);
+    SetDlgItemTextW(window, kSettingsExtraGuardKeys, g_extraGuardKeysText.c_str());
     SetDlgItemInt(window, kSettingsGatherPulse, timing.gatherPulseMs, FALSE);
     SetDlgItemInt(window, kSettingsGatherInterval, timing.gatherIntervalMs, FALSE);
 
@@ -1244,6 +1839,9 @@ void PopulateSettings(HWND window) {
                              button == XINPUT_GAMEPAD_X ? 2 :
                              button == XINPUT_GAMEPAD_Y ? 3 : 4;
     SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, selection, 0);
+    const int controllerIndex = g_gatherControllerIndex.load(std::memory_order_acquire);
+    SendDlgItemMessageW(window, kSettingsGatherController, CB_SETCURSEL,
+                        controllerIndex < 0 ? 0 : controllerIndex + 1, 0);
     const LRESULT preset = timing.stepIntervalMs == 180 ? 1 :
                            timing.stepIntervalMs == 150 ? 2 :
                            timing.stepIntervalMs == 120 ? 3 : 0;
@@ -1276,14 +1874,21 @@ bool WriteIniNumber(const std::wstring& iniPath, const wchar_t* section,
     return WritePrivateProfileStringW(section, key, text.c_str(), iniPath.c_str()) != FALSE;
 }
 
+bool WriteIniText(const std::wstring& iniPath, const wchar_t* section,
+                  const wchar_t* key, const wchar_t* value) {
+    return WritePrivateProfileStringW(section, key, value, iniPath.c_str()) != FALSE;
+}
+
 void SaveSettings(HWND window) {
     if (g_configPath.empty()) {
-        MessageBoxW(window, L"No se encontró MH3WorldControls.ini junto al helper.",
+        Log("ERROR: no se pudo determinar donde guardar la configuracion.");
+        MessageBoxW(window, L"No se pudo determinar dónde guardar la configuración.",
                     L"Configuración", MB_OK | MB_ICONERROR);
         return;
     }
 
-    WheelTiming timing = GetWheelTiming();
+    const WheelTiming previousTiming = GetWheelTiming();
+    WheelTiming timing = previousTiming;
     if (!ReadSettingsNumber(window, kSettingsWheelInitialDelay, 300, 1000,
                              L"La espera inicial", timing.initialDelayMs) ||
         !ReadSettingsNumber(window, kSettingsWheelPulse, 50, 100,
@@ -1294,11 +1899,30 @@ void SaveSettings(HWND window) {
                              L"La espera de cierre", timing.releaseDelayMs) ||
         !ReadSettingsNumber(window, kSettingsPreopenThreshold, 0, WHEEL_DELTA - 1,
                              L"La preapertura", timing.preopenThreshold) ||
+        !ReadSettingsNumber(window, kSettingsWheelSensitivity, 50, 200,
+                             L"La sensibilidad de la rueda", timing.wheelSensitivityPercent) ||
         !ReadSettingsNumber(window, kSettingsGatherPulse, 50, 100,
                              L"El pulso de recolección", timing.gatherPulseMs) ||
         !ReadSettingsNumber(window, kSettingsGatherInterval, 200, 1000,
                              L"El intervalo de recolección", timing.gatherIntervalMs))
         return;
+
+    timing.invertWheel = SendDlgItemMessageW(window, kSettingsWheelInvert, BM_GETCHECK, 0, 0) ==
+                         BST_CHECKED;
+
+    wchar_t extraGuardText[128]{};
+    GetDlgItemTextW(window, kSettingsExtraGuardKeys, extraGuardText,
+                    static_cast<int>(std::size(extraGuardText)));
+    std::array<int, kMaxExtraGuardKeys> extraGuardKeys{};
+    DWORD extraGuardKeyCount = 0;
+    if (!ParseExtraGuardKeys(extraGuardText, extraGuardKeys, extraGuardKeyCount)) {
+        MessageBoxW(window,
+            L"Las teclas extra deben ser nombres válidos separados por comas (por ejemplo: X, E, F). Se permiten hasta ocho.",
+            L"Teclas de seguridad", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(window, kSettingsExtraGuardKeys));
+        SendDlgItemMessageW(window, kSettingsExtraGuardKeys, EM_SETSEL, 0, -1);
+        return;
+    }
 
     if (timing.stepIntervalMs < timing.pulseMs) {
         MessageBoxW(window, L"El intervalo de la rueda no puede ser menor que la duración del pulso.",
@@ -1324,9 +1948,59 @@ void SaveSettings(HWND window) {
                                  selection == 2 ? L"X" :
                                  selection == 3 ? L"Y" : L"OFF";
 
-    const std::wstring stagedConfigPath = g_configPath + L".tmp";
-    if (!CopyFileW(g_configPath.c_str(), stagedConfigPath.c_str(), FALSE)) {
+    const LRESULT controllerSelection = SendDlgItemMessageW(
+        window, kSettingsGatherController, CB_GETCURSEL, 0, 0);
+    if (controllerSelection == CB_ERR) {
+        MessageBoxW(window, L"Selecciona qué mando puede activar la autorecolección.",
+                    L"Configuración", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const int gatherControllerIndex = controllerSelection == 0
+                                          ? -1 : static_cast<int>(controllerSelection - 1);
+    const std::wstring gatherControllerValue = gatherControllerIndex < 0
+                                                   ? L"any"
+                                                   : std::to_wstring(gatherControllerIndex);
+    const bool controllerNotificationsEnabled =
+        SendDlgItemMessageW(window, kSettingsControllerNotifications, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+    const size_t configSeparator = g_configPath.find_last_of(L"\\/");
+    if (configSeparator == std::wstring::npos) {
+        Log("ERROR: la ruta del INI no contiene una carpeta valida.");
+        MessageBoxW(window, L"La ruta de configuración no tiene una carpeta válida.",
+                    L"Error al guardar", MB_OK | MB_ICONERROR);
+        return;
+    }
+    const std::wstring configDirectory = g_configPath.substr(0, configSeparator);
+    if (!CreateDirectoryW(configDirectory.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
         const DWORD errorCode = GetLastError();
+        Log("ERROR: no se pudo preparar la carpeta del INI; codigo=" +
+            std::to_string(errorCode));
+        std::wstring message = L"No se pudo preparar la carpeta de configuración. Código de Windows: ";
+        message += std::to_wstring(errorCode);
+        MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    const std::wstring stagedConfigPath = g_configPath + L".tmp";
+    bool stagingReady = false;
+    if (GetFileAttributesW(g_configPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const DWORD attributesError = GetLastError();
+        if (attributesError == ERROR_FILE_NOT_FOUND || attributesError == ERROR_PATH_NOT_FOUND) {
+            HANDLE emptyStage = CreateFileW(stagedConfigPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (emptyStage != INVALID_HANDLE_VALUE) {
+                CloseHandle(emptyStage);
+                stagingReady = true;
+            }
+        }
+    } else {
+        stagingReady = CopyFileW(g_configPath.c_str(), stagedConfigPath.c_str(), FALSE) != FALSE;
+    }
+    if (!stagingReady) {
+        const DWORD errorCode = GetLastError();
+        Log("ERROR: no se pudo preparar el INI temporal; codigo=" +
+            std::to_string(errorCode));
         std::wstring message = L"No se pudo preparar una copia segura del INI. Código de Windows: ";
         message += std::to_wstring(errorCode);
         MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
@@ -1356,11 +2030,19 @@ void SaveSettings(HWND window) {
     writeNumber(L"Wheel", L"step_interval_ms", timing.stepIntervalMs);
     writeNumber(L"Wheel", L"release_delay_ms", timing.releaseDelayMs);
     writeNumber(L"Wheel", L"preopen_threshold", timing.preopenThreshold);
+    writeNumber(L"Wheel", L"sensitivity_percent", timing.wheelSensitivityPercent);
+    writeNumber(L"Wheel", L"invert", timing.invertWheel ? 1 : 0);
     SetLastError(ERROR_SUCCESS);
     recordWrite(WritePrivateProfileStringW(L"Controller", L"gather_button", buttonValue,
                                            stagedConfigPath.c_str()) != FALSE);
     writeNumber(L"Controller", L"gather_pulse_ms", timing.gatherPulseMs);
     writeNumber(L"Controller", L"gather_interval_ms", timing.gatherIntervalMs);
+    writeNumber(L"Controller", L"connection_notifications", controllerNotificationsEnabled ? 1 : 0);
+    SetLastError(ERROR_SUCCESS);
+    recordWrite(WriteIniText(stagedConfigPath, L"Controller", L"gather_controller",
+                             gatherControllerValue.c_str()));
+    SetLastError(ERROR_SUCCESS);
+    recordWrite(WriteIniText(stagedConfigPath, L"Input", L"extra_guard_keys", extraGuardText));
 
     // WritePrivateProfileString returns zero when asked to flush its profile cache,
     // including after a successful flush. Verify the file itself instead of using
@@ -1381,6 +2063,8 @@ void SaveSettings(HWND window) {
     }
     if (!saved) {
         DeleteFileW(stagedConfigPath.c_str());
+        Log("ERROR: fallo al escribir o vaciar el INI temporal; codigo=" +
+            std::to_string(saveError));
         std::wstring message = L"No se pudo guardar la configuración completa; el INI anterior sigue intacto. Código de Windows: ";
         message += std::to_wstring(saveError);
         MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
@@ -1391,18 +2075,28 @@ void SaveSettings(HWND window) {
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         const DWORD errorCode = GetLastError();
         DeleteFileW(stagedConfigPath.c_str());
+        Log("ERROR: no se pudo reemplazar el INI; codigo=" + std::to_string(errorCode));
         std::wstring message = L"No se pudo reemplazar MH3WorldControls.ini. Los valores no se aplicaron. Código de Windows: ";
         message += std::to_wstring(errorCode);
         MessageBoxW(window, message.c_str(), L"Error al guardar", MB_OK | MB_ICONERROR);
         return;
     }
 
+    if (timing.wheelSensitivityPercent != previousTiming.wheelSensitivityPercent ||
+        timing.invertWheel != previousTiming.invertWheel) {
+        DiscardPendingWheelInput(true);
+    }
     ApplyWheelTiming(timing);
+    ApplyExtraGuardKeys(extraGuardKeys, extraGuardKeyCount);
+    g_extraGuardKeysText = extraGuardText;
     g_controllerGatherButton.store(selection == 0 ? XINPUT_GAMEPAD_B :
                                    selection == 1 ? XINPUT_GAMEPAD_A :
                                    selection == 2 ? XINPUT_GAMEPAD_X :
                                    selection == 3 ? XINPUT_GAMEPAD_Y : 0,
                                    std::memory_order_release);
+    g_gatherControllerIndex.store(gatherControllerIndex, std::memory_order_release);
+    g_controllerNotificationsEnabled.store(controllerNotificationsEnabled,
+                                           std::memory_order_release);
     Log("Configuracion guardada y aplicada sin reiniciar.");
     if (g_mainWindow != nullptr)
         InvalidateRect(g_mainWindow, nullptr, FALSE);
@@ -1415,33 +2109,39 @@ void DrawSettingsWindow(HDC dc, const RECT& client) {
     DeleteObject(background);
 
     RECT title{24, 17, client.right - 24, 48};
-    DrawUiText(dc, L"Configuración", title, kUiText, g_uiBoldFont);
+    DrawUiText(dc, L"Configuración", title, kUiText, g_uiPaintBoldFont);
     RECT subtitle{25, 47, client.right - 24, 69};
-    DrawUiText(dc, L"Ajusta los controles y aplica sin reiniciar", subtitle, kUiMuted, g_uiFont);
+    DrawUiText(dc, L"Ajusta los controles y aplica sin reiniciar", subtitle, kUiMuted, g_uiPaintFont);
 
-    DrawUiCard(dc, RECT{20, 78, client.right - 20, 292});
+    DrawUiCard(dc, RECT{20, 78, client.right - 20, 365});
     RECT wheelHeader{39, 88, 220, 112};
-    DrawUiText(dc, L"RUEDA DEL RATÓN", wheelHeader, kUiCyan, g_uiBoldFont);
-    DrawUiCard(dc, RECT{20, 303, client.right - 20, 452});
-    RECT controllerHeader{39, 313, client.right - 38, 337};
-    DrawUiText(dc, L"MANDO / AUTORECOLECCIÓN", controllerHeader, kUiCyan, g_uiBoldFont);
+    DrawUiText(dc, L"RUEDA DEL RATÓN", wheelHeader, kUiCyan, g_uiPaintBoldFont);
+    DrawUiCard(dc, RECT{20, 376, client.right - 20, 580});
+    RECT controllerHeader{39, 386, client.right - 38, 410};
+    DrawUiText(dc, L"MANDO / AUTORECOLECCIÓN", controllerHeader, kUiCyan, g_uiPaintBoldFont);
 
     RECT footer{23, client.bottom - 27, client.right - 23, client.bottom - 7};
-    DrawUiText(dc, L"Los valores se guardan en MH3WorldControls.ini.", footer, kUiMuted, g_uiFont);
+    DrawUiText(dc, L"El INI se guarda en LocalAppData; el antiguo se migra automáticamente.",
+               footer, kUiMuted, g_uiPaintFont);
 }
 
 LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
+        SetPropW(window, kDpiPropertyName,
+                 reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(g_uiDpi)));
         CreateSettingsLabel(window, L"Ritmo:", 88);
         CreateSettingsLabel(window, L"Espera inicial (300–1000 ms)", 119);
         CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 150);
         CreateSettingsLabel(window, L"Intervalo entre pasos (100–600 ms)", 181);
         CreateSettingsLabel(window, L"Espera para cerrar (550–1000 ms)", 212);
         CreateSettingsLabel(window, L"Preapertura de la rueda (0–119)", 243);
-        CreateSettingsLabel(window, L"Botón de recolección", 346);
-        CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 377);
-        CreateSettingsLabel(window, L"Intervalo entre intentos (200–1000 ms)", 408);
+        CreateSettingsLabel(window, L"Sensibilidad (50–200 %)", 274);
+        CreateSettingsLabel(window, L"Teclas extra para bloquear", 306, 42, 170);
+        CreateSettingsLabel(window, L"Botón de recolección", 419);
+        CreateSettingsLabel(window, L"Mando permitido", 450);
+        CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 481);
+        CreateSettingsLabel(window, L"Intervalo entre intentos (200–1000 ms)", 512);
 
         const WheelTiming timing = GetWheelTiming();
         HWND controls[] = {
@@ -1450,12 +2150,13 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
             CreateSettingsEdit(window, kSettingsWheelStep, 180, timing.stepIntervalMs, 100, 600),
             CreateSettingsEdit(window, kSettingsWheelRelease, 211, timing.releaseDelayMs, 550, 1000),
             CreateSettingsEdit(window, kSettingsPreopenThreshold, 242, timing.preopenThreshold, 0, WHEEL_DELTA - 1),
-            CreateSettingsEdit(window, kSettingsGatherPulse, 376, timing.gatherPulseMs, 50, 100),
-            CreateSettingsEdit(window, kSettingsGatherInterval, 407, timing.gatherIntervalMs, 200, 1000)
+            CreateSettingsEdit(window, kSettingsWheelSensitivity, 273, timing.wheelSensitivityPercent, 50, 200),
+            CreateSettingsEdit(window, kSettingsGatherPulse, 480, timing.gatherPulseMs, 50, 100),
+            CreateSettingsEdit(window, kSettingsGatherInterval, 511, timing.gatherIntervalMs, 200, 1000)
         };
         HWND wheelPresetCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-            337, 87, 143, 150, window,
+            ScaleUi(337), ScaleUi(87), ScaleUi(143), ScaleUi(150), window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsWheelPreset)), nullptr, nullptr);
         if (wheelPresetCombo != nullptr) {
             const wchar_t* presets[] = {L"Personalizado", L"Suave · 180 ms",
@@ -1466,7 +2167,7 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         HWND gatherCombo = CreateWindowExW(0, L"COMBOBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-            356, 344, 112, 150, window,
+            ScaleUi(356), ScaleUi(418), ScaleUi(112), ScaleUi(150), window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsGatherButton)), nullptr, nullptr);
         if (gatherCombo != nullptr) {
             const wchar_t* buttons[] = {L"B / Círculo", L"A", L"X", L"Y", L"Desactivar"};
@@ -1475,17 +2176,49 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
             SendMessageW(gatherCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
         }
 
+        HWND controllerCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            ScaleUi(356), ScaleUi(449), ScaleUi(112), ScaleUi(150), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsGatherController)), nullptr, nullptr);
+        if (controllerCombo != nullptr) {
+            const wchar_t* controllerChoices[] = {L"Cualquiera", L"Mando 1", L"Mando 2",
+                                                   L"Mando 3", L"Mando 4"};
+            for (const wchar_t* choice : controllerChoices)
+                SendMessageW(controllerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(choice));
+            SendMessageW(controllerCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        }
+        HWND extraGuardEdit = CreateSettingsTextInput(window, kSettingsExtraGuardKeys, 305,
+                                                       g_extraGuardKeysText.c_str());
+        HWND invertCheck = CreateWindowExW(0, L"BUTTON", L"Invertir dirección del scroll",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            ScaleUi(42), ScaleUi(336), ScaleUi(240), ScaleUi(24), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsWheelInvert)), nullptr, nullptr);
+        if (invertCheck != nullptr)
+            SendMessageW(invertCheck, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+
+        HWND notificationsCheck = CreateWindowExW(0, L"BUTTON", L"Avisar al conectar o desconectar mando",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            ScaleUi(42), ScaleUi(548), ScaleUi(400), ScaleUi(24), window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsControllerNotifications)), nullptr, nullptr);
+        if (notificationsCheck != nullptr)
+            SendMessageW(notificationsCheck, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+
         HWND defaults = CreateWindowExW(0, L"BUTTON", L"Valores iniciales",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 20, 473, 148, 42,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(20), ScaleUi(590), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsDefaults)), nullptr, nullptr);
         HWND save = CreateWindowExW(0, L"BUTTON", L"Guardar y aplicar",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 186, 473, 148, 42,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(186), ScaleUi(590), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsSave)), nullptr, nullptr);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancelar",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 352, 473, 148, 42,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(352), ScaleUi(590), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), nullptr, nullptr);
         if (std::any_of(std::begin(controls), std::end(controls), [](HWND control) { return control == nullptr; }) ||
-            wheelPresetCombo == nullptr || gatherCombo == nullptr || defaults == nullptr ||
+            wheelPresetCombo == nullptr || gatherCombo == nullptr || controllerCombo == nullptr ||
+            extraGuardEdit == nullptr || invertCheck == nullptr || notificationsCheck == nullptr ||
+            defaults == nullptr ||
             save == nullptr || cancel == nullptr)
             return -1;
 
@@ -1496,12 +2229,23 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
     }
     case WM_ERASEBKGND:
         return 1;
+    case WM_DPICHANGED:
+        HandleDpiChanged(window, HIWORD(wParam),
+                         reinterpret_cast<const RECT*>(lParam));
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(window, &paint);
-        RECT client{};
-        GetClientRect(window, &client);
-        DrawSettingsWindow(dc, client);
+        RECT physicalClient{};
+        GetClientRect(window, &physicalClient);
+        const int saved = SaveDC(dc);
+        SetMapMode(dc, MM_ANISOTROPIC);
+        SetWindowExtEx(dc, kSettingsLogicalWidth, kSettingsLogicalHeight, nullptr);
+        SetViewportExtEx(dc, physicalClient.right, physicalClient.bottom, nullptr);
+        const RECT logicalClient{0, 0, kSettingsLogicalWidth, kSettingsLogicalHeight};
+        DrawSettingsWindow(dc, logicalClient);
+        if (saved != 0)
+            RestoreDC(dc, saved);
         EndPaint(window, &paint);
         return 0;
     }
@@ -1535,6 +2279,16 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         InflateRect(&textRect, -5, 0);
         DrawUiText(item->hDC, label, textRect, kUiText, g_uiBoldFont,
                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if ((item->itemState & ODS_FOCUS) != 0) {
+            RECT focusRect = item->rcItem;
+            InflateRect(&focusRect, -8, -6);
+            DrawFocusRect(item->hDC, &focusRect);
+        }
+        if ((item->itemState & ODS_FOCUS) != 0) {
+            RECT focusRect = item->rcItem;
+            InflateRect(&focusRect, -5, -5);
+            DrawFocusRect(item->hDC, &focusRect);
+        }
         SelectObject(item->hDC, oldBrush);
         SelectObject(item->hDC, oldPen);
         DeleteObject(brush);
@@ -1583,6 +2337,7 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
             g_settingsListBrush = nullptr;
         }
         g_settingsWindow = nullptr;
+        RemovePropW(window, kDpiPropertyName);
         if (g_mainWindow != nullptr)
             InvalidateRect(g_mainWindow, nullptr, FALSE);
         return 0;
@@ -1616,8 +2371,8 @@ void OpenSettingsWindow() {
     g_settingsEditBrush = CreateSolidBrush(kUiPanelRaised);
     g_settingsListBrush = CreateSolidBrush(kUiPanelRaised);
     constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    RECT bounds{0, 0, 520, 555};
-    AdjustWindowRect(&bounds, style, FALSE);
+    RECT bounds{0, 0, ScaleUi(kSettingsLogicalWidth), ScaleUi(kSettingsLogicalHeight)};
+    AdjustWindowRectForDpiSafe(&bounds, style, FALSE, WS_EX_DLGMODALFRAME, g_uiDpi);
     g_settingsWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, kSettingsWindowClassName,
         L"MH3 World Controls · Configuración", style, CW_USEDEFAULT, CW_USEDEFAULT,
         bounds.right - bounds.left, bounds.bottom - bounds.top,
@@ -1648,25 +2403,30 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
     switch (message) {
     case WM_CREATE: {
-        g_uiFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        g_uiBoldFont = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        SetPropW(window, kDpiPropertyName,
+                 reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(g_uiDpi)));
+        CreateUiFonts(g_uiDpi);
         g_toggleWheelControl = CreateWindowExW(0, L"BUTTON", L"Pausar rueda",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 25, 454, 215, 48,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(25), ScaleUi(454), ScaleUi(158), ScaleUi(48),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kToggleWheelButton)), nullptr, nullptr);
         const HWND configControl = CreateWindowExW(0, L"BUTTON", L"Configuración",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 252, 454, 215, 48,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(195), ScaleUi(454), ScaleUi(158), ScaleUi(48),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kOpenConfigButton)), nullptr, nullptr);
+        const HWND diagnosticsControl = CreateWindowExW(0, L"BUTTON", L"Copiar diagnóstico",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(365), ScaleUi(454), ScaleUi(158), ScaleUi(48),
+            window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCopyDiagnosticsButton)), nullptr, nullptr);
         const HWND exitControl = CreateWindowExW(0, L"BUTTON", L"Cerrar helper",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 479, 454, 215, 48,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            ScaleUi(535), ScaleUi(454), ScaleUi(158), ScaleUi(48),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kExitButton)), nullptr, nullptr);
-        if (g_uiFont == nullptr || g_uiBoldFont == nullptr || g_toggleWheelControl == nullptr ||
-            configControl == nullptr || exitControl == nullptr)
+        if (g_uiFont == nullptr || g_uiBoldFont == nullptr || g_uiPaintFont == nullptr ||
+            g_uiPaintBoldFont == nullptr || g_toggleWheelControl == nullptr ||
+            configControl == nullptr || diagnosticsControl == nullptr || exitControl == nullptr)
             return -1;
-        for (int id : {kToggleWheelButton, kOpenConfigButton, kExitButton}) {
+        for (int id : {kToggleWheelButton, kOpenConfigButton, kCopyDiagnosticsButton, kExitButton}) {
             const HWND control = GetDlgItem(window, id);
             if (control != nullptr)
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiBoldFont), TRUE);
@@ -1677,12 +2437,23 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     }
     case WM_ERASEBKGND:
         return 1;
+    case WM_DPICHANGED:
+        HandleDpiChanged(window, HIWORD(wParam),
+                         reinterpret_cast<const RECT*>(lParam));
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(window, &paint);
-        RECT client{};
-        GetClientRect(window, &client);
-        DrawMainWindow(dc, client);
+        RECT physicalClient{};
+        GetClientRect(window, &physicalClient);
+        const int saved = SaveDC(dc);
+        SetMapMode(dc, MM_ANISOTROPIC);
+        SetWindowExtEx(dc, kMainLogicalWidth, kMainLogicalHeight, nullptr);
+        SetViewportExtEx(dc, physicalClient.right, physicalClient.bottom, nullptr);
+        const RECT logicalClient{0, 0, kMainLogicalWidth, kMainLogicalHeight};
+        DrawMainWindow(dc, logicalClient);
+        if (saved != 0)
+            RestoreDC(dc, saved);
         EndPaint(window, &paint);
         return 0;
     }
@@ -1720,6 +2491,9 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         case kOpenConfigButton:
             OpenSettingsWindow();
             return 0;
+        case kCopyDiagnosticsButton:
+            CopyDiagnostics(window);
+            return 0;
         case kExitButton:
             PostMessageW(window, WM_CLOSE, 0, 0);
             return 0;
@@ -1728,7 +2502,13 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case WM_TIMER:
         if (wParam == 1) {
             CheckControllerConnectionChange();
-            InvalidateRect(window, nullptr, FALSE);
+            RECT client{};
+            GetClientRect(window, &client);
+            RECT gameStatus{ScaleUi(25), ScaleUi(98), client.right - ScaleUi(25), ScaleUi(213)};
+            RECT controllerStatus{client.right / 2 + ScaleUi(8), ScaleUi(228),
+                                  client.right - ScaleUi(25), ScaleUi(337)};
+            InvalidateRect(window, &gameStatus, FALSE);
+            InvalidateRect(window, &controllerStatus, FALSE);
         }
         return 0;
     case kUiStatusMessage:
@@ -1783,6 +2563,15 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
             DeleteObject(g_uiBoldFont);
             g_uiBoldFont = nullptr;
         }
+        if (g_uiPaintFont != nullptr) {
+            DeleteObject(g_uiPaintFont);
+            g_uiPaintFont = nullptr;
+        }
+        if (g_uiPaintBoldFont != nullptr) {
+            DeleteObject(g_uiPaintBoldFont);
+            g_uiPaintBoldFont = nullptr;
+        }
+        RemovePropW(window, kDpiPropertyName);
         g_toggleWheelControl = nullptr;
         PostQuitMessage(0);
         return 0;
@@ -1800,9 +2589,46 @@ void CleanupHooks() {
         g_keyboardHook = nullptr;
     }
 }
+
+void InputHookThreadMain() {
+    g_hookThreadId = GetCurrentThreadId();
+    MSG message{};
+    PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook,
+                                       GetModuleHandleW(nullptr), 0);
+    if (g_keyboardHook == nullptr) {
+        const DWORD errorCode = GetLastError();
+        g_hookErrorCode.store(errorCode, std::memory_order_release);
+        Log("ERROR: fallo el hook de teclado; codigo=" + std::to_string(errorCode));
+        SetEvent(g_hookReadyEvent);
+        return;
+    }
+
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook,
+                                    GetModuleHandleW(nullptr), 0);
+    if (g_mouseHook == nullptr) {
+        const DWORD errorCode = GetLastError();
+        g_hookErrorCode.store(errorCode, std::memory_order_release);
+        Log("ERROR: fallo el hook de raton; codigo=" + std::to_string(errorCode));
+        CleanupHooks();
+        SetEvent(g_hookReadyEvent);
+        return;
+    }
+
+    SnapshotPhysicalActionState();
+    SetEvent(g_hookReadyEvent);
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    CleanupHooks();
+}
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    EnableDpiAwareness();
+    g_uiDpi = GetSystemDpiSafe();
     g_mainThreadId = GetCurrentThreadId();
     if (!EnsureSingleInstance())
         return 0;
@@ -1842,8 +2668,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     constexpr DWORD windowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT windowRect{0, 0, 720, 540};
-    AdjustWindowRect(&windowRect, windowStyle, FALSE);
+    RECT windowRect{0, 0, ScaleUi(kMainLogicalWidth), ScaleUi(kMainLogicalHeight)};
+    AdjustWindowRectForDpiSafe(&windowRect, windowStyle, FALSE, 0, g_uiDpi);
     g_mainWindow = CreateWindowExW(0, kWindowClassName, L"MH3 World Controls",
         windowStyle, CW_USEDEFAULT, CW_USEDEFAULT,
         windowRect.right - windowRect.left, windowRect.bottom - windowRect.top,
@@ -1856,28 +2682,40 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         return 1;
     }
 
-    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
-    if (g_keyboardHook == nullptr) {
-        ShowWindowsError(L"No se pudo instalar el hook del teclado.");
+    g_hookReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_hookReadyEvent == nullptr) {
+        ShowWindowsError(L"No se pudo preparar el hilo de captura de entrada.");
         DestroyWindow(g_mainWindow);
-        CleanupHooks();
         if (g_xinputModule != nullptr)
             FreeLibrary(g_xinputModule);
         CloseHandle(g_instanceGuard);
         return 1;
     }
-
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
-    if (g_mouseHook == nullptr) {
-        ShowWindowsError(L"No se pudo instalar el hook del ratón.");
+    std::thread hookThread(InputHookThreadMain);
+    const DWORD hookWait = WaitForSingleObject(g_hookReadyEvent, 5000);
+    CloseHandle(g_hookReadyEvent);
+    g_hookReadyEvent = nullptr;
+    const DWORD hookError = g_hookErrorCode.load(std::memory_order_acquire);
+    if (hookWait != WAIT_OBJECT_0 || hookError != ERROR_SUCCESS) {
+        if (hookWait == WAIT_OBJECT_0) {
+            std::wstring messageText = L"No se pudo instalar un hook de entrada. Código de Windows: ";
+            messageText += std::to_wstring(hookError);
+            MessageBoxW(g_mainWindow, messageText.c_str(), L"MH3 World Controls",
+                        MB_OK | MB_ICONERROR);
+        } else {
+            MessageBoxW(g_mainWindow, L"El hilo de captura no respondió al iniciar.",
+                        L"MH3 World Controls", MB_OK | MB_ICONERROR);
+            if (g_hookThreadId != 0)
+                PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+        }
+        if (hookThread.joinable())
+            hookThread.join();
         DestroyWindow(g_mainWindow);
-        CleanupHooks();
         if (g_xinputModule != nullptr)
             FreeLibrary(g_xinputModule);
         CloseHandle(g_instanceGuard);
         return 1;
     }
-    SnapshotPhysicalActionState();
 
     g_wheelHotkeyRegistered = RegisterHotKey(g_mainWindow, 2, MOD_NOREPEAT, VK_F8) != FALSE;
     if (!g_wheelHotkeyRegistered)
@@ -1887,7 +2725,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     if (!g_exitHotkeyRegistered) {
         ShowWindowsError(L"No se pudo registrar F9 para cerrar el helper.");
         DestroyWindow(g_mainWindow);
-        CleanupHooks();
+        PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+        hookThread.join();
         if (g_xinputModule != nullptr)
             FreeLibrary(g_xinputModule);
         CloseHandle(g_instanceGuard);
@@ -1911,8 +2750,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     g_running.store(false, std::memory_order_release);
     worker.join();
     g_mainWindow = nullptr;
-    ReleaseWheelModifier(true);
-    CleanupHooks();
+    ReleaseWheelModifier();
+    PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+    hookThread.join();
     if (g_xinputModule != nullptr)
         FreeLibrary(g_xinputModule);
     CloseHandle(g_instanceGuard);
