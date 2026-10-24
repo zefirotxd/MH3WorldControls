@@ -30,7 +30,7 @@ MH3 World Controls mejora dos controles repetitivos de **OceanTriRecomp**: cambi
 
 - Windows 10 u 11, 64 bits.
 - OceanTriRecomp para Windows.
-- Para autorecolección con mando: un mando que Windows exponga como **XInput**. En mandos PlayStation, activa Steam Input o DS4Windows con emulación Xbox.
+- Para autorecolección con mando: un mando que Windows exponga como **XInput**. En mandos PlayStation, activa Steam Input o DS4Windows con emulación Xbox. Los mandos que conectes mientras el helper está abierto se detectan en un máximo aproximado de dos segundos.
 
 ### Instalación rápida
 
@@ -63,12 +63,12 @@ Los tiempos están en `MH3WorldControls.ini`, junto al ejecutable:
 
 Reinicia el helper para aplicar cambios. Los valores más altos hacen la navegación más pausada. Mantén los mínimos de espera y liberación: ayudan a que la selección no se confunda con el uso del objeto.
 
-En `[Controller]`, `gather_button` elige el botón físico XInput que activa los pulsos de recolección: `A`, `B`, `X`, `Y` u `OFF`. El valor inicial `B` coincide con el botón Este del mapeo predeterminado del juego.
+En `[Controller]`, `gather_button` elige el botón físico XInput que activa los pulsos de recolección: `A`, `B`, `X`, `Y` u `OFF`. El valor inicial `B` coincide con el botón Este del mapeo predeterminado del juego. `gather_pulse_ms` ajusta la duración de cada toque (50–100 ms) y `gather_interval_ms` el tiempo entre toques (200–1000 ms); el valor inicial de 300 ms conserva el ritmo actual.
 
 ### Solución de problemas
 
 - **La rueda no cambia objetos:** confirma que el helper está abierto y que OceanTriRecomp tiene el foco. Revisa que otra aplicación no esté capturando la rueda.
-- **La autorecolección con mando no se activa:** Windows debe mostrar el mando como XInput; mantén B/Círculo, que corresponde al botón Este del mapeo predeterminado. Los mandos disponibles únicamente como SDL/DirectInput no pueden ser leídos por este helper externo.
+- **La autorecolección con mando no se activa:** Windows debe mostrar el mando como XInput; mantén B/Círculo, que corresponde al botón Este del mapeo predeterminado. Espera dos segundos si conectaste el mando con el helper abierto. Los mandos disponibles únicamente como SDL/DirectInput no pueden ser leídos por este helper externo.
 - **No se detecta el juego:** abre OceanTriRecomp y deja su ventana en primer plano. El ejecutable debe llamarse `OceanTriRecomp.exe`.
 - **El helper no puede enviar teclas:** ejecuta el helper y el juego con el mismo nivel de permisos.
 - **Una acción de arma cancela el cambio:** el helper descarta los giros que coinciden con entradas de acción detectadas; vuelve a girar al terminar la acción.
@@ -107,13 +107,13 @@ MH3 World Controls is a small Windows quality-of-life helper for **OceanTriRecom
 ### Requirements and setup
 
 - Windows 10 or 11, 64-bit, and the Windows version of OceanTriRecomp.
-- For controller auto-gather, the controller must be exposed to Windows as **XInput**. For PlayStation controllers, use Steam Input or DS4Windows in Xbox emulation mode.
+- For controller auto-gather, the controller must be exposed to Windows as **XInput**. For PlayStation controllers, use Steam Input or DS4Windows in Xbox emulation mode. Controllers connected while the helper is open are detected within about two seconds.
 - Download the Windows ZIP from [Releases](https://github.com/zefirotxd/MH3WorldControls/releases), extract it, start `MH3WorldControls.exe`, then launch the game.
 - The helper only acts while OceanTriRecomp is in the foreground. Run both programs at the same permission level.
 
 The timing values can be edited in `MH3WorldControls.ini` beside the executable. See the Spanish section above for the setting names and supported ranges.
 
-In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping.
+In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping. `gather_pulse_ms` controls tap length (50–100 ms), and `gather_interval_ms` controls the repeat interval (200–1000 ms); the default 300 ms keeps the current pace.
 
 ### Build
 

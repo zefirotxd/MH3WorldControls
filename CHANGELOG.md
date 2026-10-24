@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-preview.3
+
+- Added INI controls for the auto-gather pulse duration and repeat interval while preserving the current defaults.
+- Added startup output showing the active gathering cadence.
+- Kept connected controllers responsive while spacing out checks for empty XInput slots; newly connected pads are discovered within two seconds.
+- Avoided treating a rejected synthetic key press as an active gathering pulse.
+
 ## 0.1.0-preview.2
 
 - Made the XInput auto-gather button configurable (`A`, `B`, `X`, `Y`, or `OFF`).

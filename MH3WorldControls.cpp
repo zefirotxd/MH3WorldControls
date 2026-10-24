@@ -4,6 +4,7 @@
 #include <Xinput.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -29,6 +30,8 @@ struct WheelTiming {
     DWORD stepIntervalMs = 150;
     DWORD releaseDelayMs = 550;
     DWORD preopenThreshold = 60;
+    DWORD gatherPulseMs = 60;
+    DWORD gatherIntervalMs = 300;
 };
 WheelTiming g_wheelTiming;
 
@@ -61,6 +64,9 @@ HANDLE g_instanceGuard = nullptr;
 HMODULE g_xinputModule = nullptr;
 using XInputGetStateProc = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
 XInputGetStateProc g_xinputGetState = nullptr;
+std::mutex g_xinputStateMutex;
+std::array<bool, XUSER_MAX_COUNT> g_xinputConnected{};
+Clock::time_point g_nextXinputDiscovery{};
 constexpr WORD kMouseRightAction = 0xFFFF;
 constexpr ULONG_PTR kWheelActionTag = 0x4D483357; // "MH3W"
 
@@ -118,6 +124,12 @@ void LoadWheelTiming() {
         g_controllerGatherButton = XINPUT_GAMEPAD_B;
         Log("Controller.gather_button invalido; se usara B como valor seguro.");
     }
+    g_wheelTiming.gatherPulseMs = std::clamp<DWORD>(
+        GetPrivateProfileIntW(L"Controller", L"gather_pulse_ms", 60, configPath.c_str()), 50, 100);
+    g_wheelTiming.gatherIntervalMs = std::clamp<DWORD>(
+        GetPrivateProfileIntW(L"Controller", L"gather_interval_ms", 300, configPath.c_str()), 200, 1000);
+    g_wheelTiming.gatherIntervalMs = std::max(g_wheelTiming.gatherIntervalMs,
+                                              g_wheelTiming.gatherPulseMs);
 }
 
 void Log(const std::string& message) {
@@ -290,6 +302,12 @@ XInputHeldActions ReadXInputHeldActions() {
     if (g_xinputGetState == nullptr)
         return held;
 
+    std::lock_guard<std::mutex> lock(g_xinputStateMutex);
+    const auto now = Clock::now();
+    const bool discoverControllers = now >= g_nextXinputDiscovery;
+    if (discoverControllers)
+        g_nextXinputDiscovery = now + std::chrono::seconds(2);
+
     constexpr WORD kCombatButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B |
                                    XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y |
                                    XINPUT_GAMEPAD_LEFT_SHOULDER |
@@ -297,9 +315,17 @@ XInputHeldActions ReadXInputHeldActions() {
                                    XINPUT_GAMEPAD_LEFT_THUMB |
                                    XINPUT_GAMEPAD_RIGHT_THUMB;
     for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex) {
-        XINPUT_STATE state{};
-        if (g_xinputGetState(userIndex, &state) != ERROR_SUCCESS)
+        // Keep connected pads responsive at the worker's normal rate, but avoid
+        // polling empty XInput slots every 5 ms. Discover new pads every 2 s.
+        if (!g_xinputConnected[userIndex] && !discoverControllers)
             continue;
+
+        XINPUT_STATE state{};
+        if (g_xinputGetState(userIndex, &state) != ERROR_SUCCESS) {
+            g_xinputConnected[userIndex] = false;
+            continue;
+        }
+        g_xinputConnected[userIndex] = true;
 
         const auto& pad = state.Gamepad;
         const bool rightShoulderHeld = (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
@@ -779,10 +805,10 @@ void PickupWorker() {
         if (!pickupHeld) {
             nextPickup = Clock::time_point::min();
         } else if (!pickupPressed && now >= nextPickup && IsGameForeground()) {
-            SendKey('F', true);
-            pickupPressed = true;
-            releasePickup = now + std::chrono::milliseconds(60);
-            nextPickup = now + std::chrono::milliseconds(300);
+            pickupPressed = SendKey('F', true);
+            if (pickupPressed)
+                releasePickup = now + std::chrono::milliseconds(g_wheelTiming.gatherPulseMs);
+            nextPickup = now + std::chrono::milliseconds(g_wheelTiming.gatherIntervalMs);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -864,7 +890,9 @@ int main() {
               << "Rueda: espera " << g_wheelTiming.initialDelayMs << " ms, pulso "
               << g_wheelTiming.pulseMs << " ms, paso " << g_wheelTiming.stepIntervalMs
               << " ms, preapertura " << g_wheelTiming.preopenThreshold
-              << " unidades. Configura MH3WorldControls.ini junto al helper.\n";
+              << " unidades. Recoleccion: pulso " << g_wheelTiming.gatherPulseMs
+              << " ms cada " << g_wheelTiming.gatherIntervalMs
+              << " ms. Configura MH3WorldControls.ini junto al helper.\n";
 
     std::thread worker(PickupWorker);
     while (g_running.load(std::memory_order_acquire)) {
