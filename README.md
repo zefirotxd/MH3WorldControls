@@ -16,6 +16,8 @@
 
 MH3 World Controls mejora dos controles repetitivos de **OceanTriRecomp**: cambiar objetos con la rueda del ratón y mantener la acción de confirmar para recolectar. Se ejecuta como un helper independiente de Windows; no reemplaza archivos del juego ni se instala en la carpeta `mods/`.
 
+La aplicación incluye una ventana de estado para comprobar si el juego está enfocado, ver los mandos XInput detectados, pausar la rueda y abrir la configuración.
+
 ### Funciones
 
 - Cambia objetos con la rueda sin mantener Q.
@@ -93,6 +95,8 @@ Este proyecto es un helper de entrada para Windows, no un mod de reemplazo de ar
 ## English
 
 MH3 World Controls is a small Windows quality-of-life helper for **OceanTriRecomp**. It improves mouse-wheel item selection and repeated gathering while a keyboard key or controller button is held. It runs beside the game; it is not installed through the in-game `mods/` folder.
+
+The app includes a status window to check game focus and XInput detection, pause wheel selection, and open its configuration.
 
 ### Features
 

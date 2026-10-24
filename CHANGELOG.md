@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.0-preview.4
+
+- Replaced the console window with a native dark dashboard showing game focus, wheel state, and XInput controller status.
+- Added buttons to pause/resume wheel selection, open the configuration file, and close the helper.
+- Kept F8/F9 hotkeys and the existing control worker.
+- Reported the number of connected XInput controllers, including while the game is not focused.
+
 ## 0.1.0-preview.3
 
 - Added INI controls for the auto-gather pulse duration and repeat interval while preserving the current defaults.
