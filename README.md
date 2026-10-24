@@ -35,6 +35,7 @@ La aplicación incluye una ventana de estado para comprobar si el juego está en
 - Copia un diagnóstico técnico al portapapeles sin incluir rutas personales. La versión también aparece en las propiedades del ejecutable.
 - Permite silenciar los avisos de conexión del mando sin ocultar su estado en la ventana. La interfaz escala con el DPI de Windows.
 - La ventana confirma en vivo si detecta el botón de recolección configurado y si los pulsos están activos; el diagnóstico copia también el puerto XInput que lo está enviando.
+- Permite añadir botones, direcciones de la cruceta y gatillos XInput a las guardas que descartan el scroll durante acciones.
 - El aviso del mando respeta el botón de autorecolección elegido. El icono de bandeja permite abrir la ventana con un clic y ofrece un menú con configuración, rueda y cierre.
 
 ### Requisitos
@@ -80,7 +81,7 @@ También puedes abrir **Configuración** en la ventana principal. Usa las flecha
 
 En `[Controller]`, `gather_button` elige el botón físico XInput que activa los pulsos de recolección: `A`, `B`, `X`, `Y` u `OFF`. El valor inicial `B` coincide con el botón Este del mapeo predeterminado del juego. `gather_controller=any` acepta cualquier mando; `0`, `1`, `2` o `3` limita la función a los puertos XInput 1–4. `connection_notifications=0` silencia los avisos de Windows sin ocultar el mando en el panel. `gather_pulse_ms` ajusta la duración de cada toque (50–100 ms) y `gather_interval_ms` el tiempo entre toques (200–1000 ms).
 
-En `[Input]`, `extra_guard_keys` añade hasta ocho teclas que bloquean la rueda mientras se mantienen, separadas por comas: por ejemplo `X, E, F` o `SPACE, SHIFT`. Los guardas de seguridad integrados permanecen activos.
+En `[Input]`, `extra_guard_keys` añade hasta ocho teclas que bloquean la rueda mientras se mantienen, separadas por comas: por ejemplo `X, E, F` o `SPACE, SHIFT`. `extra_guard_buttons` añade hasta dieciséis controles XInput extra: `LB`, `RB`, `LS`, `RS`, `START`, `BACK`, `DPAD_UP`, `DPAD_DOWN`, `DPAD_LEFT`, `DPAD_RIGHT`, `LT` o `RT` (también acepta A/B/X/Y). Los gatillos cuentan como pulsados desde 32/255. Estas opciones se suman a las guardas de seguridad integradas.
 
 Pulsa **Copiar diagnóstico** en la ventana principal (o desde el menú del icono de bandeja) para copiar versión, foco del juego, estado XInput, ajustes activos y errores de cola. No copia tu nombre de usuario ni la ruta completa del INI.
 Los mensajes de estado se guardan en `%LOCALAPPDATA%\MH3WorldControls\MH3WorldControls.log` y se rotan al superar 512 KB.
@@ -133,6 +134,7 @@ The app includes a status window to check game focus and XInput detection, pause
 - Keeps low-level input capture on a dedicated thread and provides privacy-conscious diagnostics in the clipboard.
 - Lets you mute controller notices while retaining the live status panel, and scales the interface for Windows display DPI.
 - Shows live feedback when the configured gather button is detected and when auto-gather pulses are active; copied diagnostics include the XInput slot sending it.
+- Lets users add XInput buttons, D-pad directions, and triggers to the action guards that discard wheel input during gameplay actions.
 - The tray icon opens the main window on click and provides a menu for settings, wheel control, and exit.
 
 ### Requirements and setup
@@ -146,7 +148,7 @@ The active configuration is `%LOCALAPPDATA%\MH3WorldControls\MH3WorldControls.in
 
 You can also open the settings window from the main window. Use the arrow controls to adjust values or choose a **Suave**, **Equilibrado**, or **Ágil** wheel preset. Choose **Guardar y aplicar** to save the settings together and use them immediately. Manual INI edits require a helper restart.
 
-In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping. Set `gather_controller` to `any` or an XInput port from `0` to `3`; set `connection_notifications=0` to mute Windows notices while keeping the status panel active. In `[Wheel]`, `sensitivity_percent` adjusts scroll sensitivity from 50% to 200%, and `invert=1` reverses direction. In `[Input]`, `extra_guard_keys` accepts up to eight comma-separated keys such as `X, E, F`; built-in safety guards remain active.
+In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping. Set `gather_controller` to `any` or an XInput port from `0` to `3`; set `connection_notifications=0` to mute Windows notices while keeping the status panel active. In `[Wheel]`, `sensitivity_percent` adjusts scroll sensitivity from 50% to 200%, and `invert=1` reverses direction. In `[Input]`, `extra_guard_keys` accepts up to eight comma-separated keys such as `X, E, F`; `extra_guard_buttons` accepts up to sixteen XInput controls such as `LT, LB, DPAD_UP`. Trigger guards activate at 32/255. These additions preserve the built-in safety guards.
 
 Use **Copiar diagnóstico** in the main window or tray menu to copy version, game-focus, controller, timing and queue status. The report excludes your Windows username and full configuration path.
 Status messages are kept in `%LOCALAPPDATA%\MH3WorldControls\MH3WorldControls.log`, rotated above 512 KB.

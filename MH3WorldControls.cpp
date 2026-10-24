@@ -52,23 +52,28 @@ constexpr int kSettingsExtraGuardKeys = 2014;
 constexpr int kSettingsWheelInvert = 2015;
 constexpr int kSettingsWheelSensitivity = 2016;
 constexpr int kSettingsControllerNotifications = 2017;
+constexpr int kSettingsExtraGuardButtons = 2018;
 constexpr int kTrayShow = 3001;
 constexpr int kTraySettings = 3002;
 constexpr int kTrayToggleWheel = 3003;
 constexpr int kTrayExit = 3004;
 constexpr int kTrayCopyDiagnostics = 3005;
 constexpr int kCopyDiagnosticsButton = 1004;
-constexpr wchar_t kAppVersion[] = L"0.1.0-preview.9";
+constexpr wchar_t kAppVersion[] = L"0.1.0-preview.10";
 constexpr int kMainLogicalWidth = 720;
 constexpr int kMainLogicalHeight = 540;
 constexpr int kSettingsLogicalWidth = 520;
-constexpr int kSettingsLogicalHeight = 665;
+constexpr int kSettingsLogicalHeight = 700;
 constexpr int kMaxExtraGuardKeys = 8;
+constexpr int kMaxExtraGuardButtons = 16;
 constexpr int64_t kWheelDeltaScale = 100;
 constexpr int64_t kScaledWheelNotch = int64_t(WHEEL_DELTA) * kWheelDeltaScale;
 std::atomic<WORD> g_controllerGatherButton{XINPUT_GAMEPAD_B};
 std::atomic<int> g_gatherControllerIndex{-1}; // -1 means any connected controller.
 std::atomic<bool> g_controllerNotificationsEnabled{true};
+std::atomic<WORD> g_extraControllerGuardButtons{0};
+std::atomic<bool> g_extraGuardLeftTrigger{false};
+std::atomic<bool> g_extraGuardRightTrigger{false};
 std::array<std::atomic<int>, kMaxExtraGuardKeys> g_extraGuardKeys{};
 std::atomic<DWORD> g_extraGuardKeyCount{0};
 
@@ -104,6 +109,7 @@ std::atomic<DWORD> g_connectedControllerCount{0};
 std::atomic<DWORD> g_connectedControllerMask{0};
 std::atomic<DWORD> g_gatherButtonHeldMask{0};
 std::atomic<DWORD> g_droppedWheelSteps{0};
+std::atomic<DWORD> g_actionGuardBlockedScrolls{0};
 std::mutex g_wheelMutex;
 std::mutex g_foregroundCacheMutex;
 std::mutex g_statusMutex;
@@ -113,6 +119,7 @@ std::deque<WORD> g_wheelDirections;
 std::wstring g_configPath;
 std::wstring g_latestLog;
 std::wstring g_extraGuardKeysText;
+std::wstring g_extraGuardButtonsText;
 int64_t g_pendingWheelDelta = 0;
 bool g_wheelBusy = false;
 DWORD g_cachedForegroundPid = 0;
@@ -437,10 +444,76 @@ bool ParseExtraGuardKeys(const std::wstring& text, std::array<int, kMaxExtraGuar
     return true;
 }
 
+bool ParseExtraGuardButtonToken(std::wstring token, WORD& buttons,
+                                bool& leftTrigger, bool& rightTrigger) {
+    token = Trim(token);
+    std::transform(token.begin(), token.end(), token.begin(),
+                   [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(ch)); });
+    buttons = 0;
+    leftTrigger = false;
+    rightTrigger = false;
+    if (token == L"A") buttons = XINPUT_GAMEPAD_A;
+    else if (token == L"B") buttons = XINPUT_GAMEPAD_B;
+    else if (token == L"X") buttons = XINPUT_GAMEPAD_X;
+    else if (token == L"Y") buttons = XINPUT_GAMEPAD_Y;
+    else if (token == L"LB" || token == L"LEFT_SHOULDER") buttons = XINPUT_GAMEPAD_LEFT_SHOULDER;
+    else if (token == L"RB" || token == L"RIGHT_SHOULDER") buttons = XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    else if (token == L"LS" || token == L"L3" || token == L"LEFT_THUMB") buttons = XINPUT_GAMEPAD_LEFT_THUMB;
+    else if (token == L"RS" || token == L"R3" || token == L"RIGHT_THUMB") buttons = XINPUT_GAMEPAD_RIGHT_THUMB;
+    else if (token == L"START") buttons = XINPUT_GAMEPAD_START;
+    else if (token == L"BACK" || token == L"SELECT") buttons = XINPUT_GAMEPAD_BACK;
+    else if (token == L"DPAD_UP") buttons = XINPUT_GAMEPAD_DPAD_UP;
+    else if (token == L"DPAD_DOWN") buttons = XINPUT_GAMEPAD_DPAD_DOWN;
+    else if (token == L"DPAD_LEFT") buttons = XINPUT_GAMEPAD_DPAD_LEFT;
+    else if (token == L"DPAD_RIGHT") buttons = XINPUT_GAMEPAD_DPAD_RIGHT;
+    else if (token == L"LT" || token == L"LEFT_TRIGGER") leftTrigger = true;
+    else if (token == L"RT" || token == L"RIGHT_TRIGGER") rightTrigger = true;
+    else return false;
+    return true;
+}
+
+bool ParseExtraGuardButtons(const std::wstring& text, WORD& buttons,
+                            bool& leftTrigger, bool& rightTrigger, DWORD& count) {
+    buttons = 0;
+    leftTrigger = false;
+    rightTrigger = false;
+    count = 0;
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t separator = text.find(L',', start);
+        WORD tokenButtons = 0;
+        bool tokenLeftTrigger = false;
+        bool tokenRightTrigger = false;
+        const std::wstring token = text.substr(start, separator == std::wstring::npos
+                                                          ? std::wstring::npos
+                                                          : separator - start);
+        if (!ParseExtraGuardButtonToken(token, tokenButtons, tokenLeftTrigger,
+                                        tokenRightTrigger) ||
+            count >= kMaxExtraGuardButtons)
+            return false;
+        buttons |= tokenButtons;
+        leftTrigger = leftTrigger || tokenLeftTrigger;
+        rightTrigger = rightTrigger || tokenRightTrigger;
+        ++count;
+        if (separator == std::wstring::npos)
+            break;
+        start = separator + 1;
+        if (start == text.size())
+            return false;
+    }
+    return true;
+}
+
 void ApplyExtraGuardKeys(const std::array<int, kMaxExtraGuardKeys>& keys, DWORD count) {
     for (DWORD index = 0; index < kMaxExtraGuardKeys; ++index)
         g_extraGuardKeys[index].store(index < count ? keys[index] : 0, std::memory_order_release);
     g_extraGuardKeyCount.store(count, std::memory_order_release);
+}
+
+void ApplyExtraGuardButtons(WORD buttons, bool leftTrigger, bool rightTrigger) {
+    g_extraControllerGuardButtons.store(buttons, std::memory_order_release);
+    g_extraGuardLeftTrigger.store(leftTrigger, std::memory_order_release);
+    g_extraGuardRightTrigger.store(rightTrigger, std::memory_order_release);
 }
 
 WheelTiming GetWheelTiming() {
@@ -539,6 +612,23 @@ void LoadWheelTiming() {
         ApplyExtraGuardKeys({}, 0);
         g_extraGuardKeysText.clear();
         Log("Input.extra_guard_keys invalido; se ignoraran las teclas adicionales.");
+    }
+
+    wchar_t extraButtonsText[512]{};
+    GetPrivateProfileStringW(L"Input", L"extra_guard_buttons", L"", extraButtonsText,
+                             static_cast<DWORD>(std::size(extraButtonsText)), g_configPath.c_str());
+    WORD extraButtons = 0;
+    bool leftTriggerGuard = false;
+    bool rightTriggerGuard = false;
+    DWORD extraButtonCount = 0;
+    if (ParseExtraGuardButtons(extraButtonsText, extraButtons, leftTriggerGuard,
+                               rightTriggerGuard, extraButtonCount)) {
+        ApplyExtraGuardButtons(extraButtons, leftTriggerGuard, rightTriggerGuard);
+        g_extraGuardButtonsText = extraButtonsText;
+    } else {
+        ApplyExtraGuardButtons(0, false, false);
+        g_extraGuardButtonsText.clear();
+        Log("Input.extra_guard_buttons invalido; se ignoraran los botones adicionales.");
     }
 }
 
@@ -787,6 +877,9 @@ XInputHeldActions ReadXInputHeldActions() {
                                    XINPUT_GAMEPAD_RIGHT_THUMB;
     const WORD gatherButton = g_controllerGatherButton.load(std::memory_order_acquire);
     const int gatherController = g_gatherControllerIndex.load(std::memory_order_acquire);
+    const WORD extraGuardButtons = g_extraControllerGuardButtons.load(std::memory_order_acquire);
+    const bool guardLeftTrigger = g_extraGuardLeftTrigger.load(std::memory_order_acquire);
+    const bool guardRightTrigger = g_extraGuardRightTrigger.load(std::memory_order_acquire);
     for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex) {
         // Keep connected pads responsive at the worker's normal rate, but avoid
         // polling empty XInput slots every 5 ms. Discover new pads every 2 s.
@@ -804,8 +897,11 @@ XInputHeldActions ReadXInputHeldActions() {
         const bool rightShoulderHeld = (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
         const bool moving = std::abs(int(pad.sThumbLX)) >= 12000 ||
                             std::abs(int(pad.sThumbLY)) >= 12000;
-        if ((pad.wButtons & kCombatButtons) != 0 ||
-            (rightShoulderHeld && !moving) || pad.bRightTrigger >= 32) {
+        const bool guardedTriggerHeld = pad.bRightTrigger >= 32 ||
+                                        (guardLeftTrigger && pad.bLeftTrigger >= 32) ||
+                                        (guardRightTrigger && pad.bRightTrigger >= 32);
+        if ((pad.wButtons & (kCombatButtons | extraGuardButtons)) != 0 ||
+            (rightShoulderHeld && !moving) || guardedTriggerHeld) {
             held.gameplayAction = true;
         }
         if (gatherButton != 0 && (gatherController < 0 ||
@@ -980,6 +1076,7 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
 
     if (actionHeldAtScroll || IsAnyGameplayActionPhysicallyHeld()) {
         // Scrolling during a charge is ignored, never queued for after the attack.
+        g_actionGuardBlockedScrolls.fetch_add(1, std::memory_order_relaxed);
         DiscardPendingWheelInput(true);
         return;
     }
@@ -1545,6 +1642,17 @@ void CopyDiagnostics(HWND owner) {
     report += maskText;
     report += L"; gather button=";
     report += gatherButton;
+    report += L"; extra guard buttons=";
+    if (g_extraGuardButtonsText.empty())
+        report += L"none";
+    else
+        report += g_extraGuardButtonsText;
+    report += L"; extra LT guard=";
+    report += g_extraGuardLeftTrigger.load(std::memory_order_acquire) ? L"on" : L"off";
+    report += L"; extra RT guard=";
+    report += g_extraGuardRightTrigger.load(std::memory_order_acquire) ? L"on" : L"off";
+    report += L"; action-guard blocked scrolls=" +
+              std::to_wstring(g_actionGuardBlockedScrolls.load(std::memory_order_relaxed));
     const int selectedController = g_gatherControllerIndex.load(std::memory_order_acquire);
     report += L"; gather controller=";
     report += selectedController < 0 ? L"any" : std::to_wstring(selectedController + 1);
@@ -1833,7 +1941,7 @@ HWND CreateSettingsTextInput(HWND window, int id, int y, const wchar_t* value) {
         ScaleUi(220), ScaleUi(y), ScaleUi(248), ScaleUi(27), window,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
     if (edit != nullptr) {
-        SendMessageW(edit, EM_SETLIMITTEXT, 120, 0);
+        SendMessageW(edit, EM_SETLIMITTEXT, 240, 0);
         SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
     }
     return edit;
@@ -1849,6 +1957,7 @@ void SetSettingsDefaults(HWND window) {
     SendDlgItemMessageW(window, kSettingsWheelInvert, BM_SETCHECK, BST_UNCHECKED, 0);
     SendDlgItemMessageW(window, kSettingsControllerNotifications, BM_SETCHECK, BST_CHECKED, 0);
     SetDlgItemTextW(window, kSettingsExtraGuardKeys, L"");
+    SetDlgItemTextW(window, kSettingsExtraGuardButtons, L"");
     SendDlgItemMessageW(window, kSettingsWheelPreset, CB_SETCURSEL, 2, 0);
     SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, 0, 0);
     SendDlgItemMessageW(window, kSettingsGatherController, CB_SETCURSEL, 0, 0);
@@ -1870,6 +1979,7 @@ void PopulateSettings(HWND window) {
         g_controllerNotificationsEnabled.load(std::memory_order_acquire) ? BST_CHECKED : BST_UNCHECKED,
         0);
     SetDlgItemTextW(window, kSettingsExtraGuardKeys, g_extraGuardKeysText.c_str());
+    SetDlgItemTextW(window, kSettingsExtraGuardButtons, g_extraGuardButtonsText.c_str());
     SetDlgItemInt(window, kSettingsGatherPulse, timing.gatherPulseMs, FALSE);
     SetDlgItemInt(window, kSettingsGatherInterval, timing.gatherIntervalMs, FALSE);
 
@@ -1961,6 +2071,24 @@ void SaveSettings(HWND window) {
             L"Teclas de seguridad", MB_OK | MB_ICONWARNING);
         SetFocus(GetDlgItem(window, kSettingsExtraGuardKeys));
         SendDlgItemMessageW(window, kSettingsExtraGuardKeys, EM_SETSEL, 0, -1);
+        return;
+    }
+
+    wchar_t extraGuardButtonText[256]{};
+    GetDlgItemTextW(window, kSettingsExtraGuardButtons, extraGuardButtonText,
+                    static_cast<int>(std::size(extraGuardButtonText)));
+    WORD extraGuardButtons = 0;
+    bool extraGuardLeftTrigger = false;
+    bool extraGuardRightTrigger = false;
+    DWORD extraGuardButtonCount = 0;
+    if (!ParseExtraGuardButtons(extraGuardButtonText, extraGuardButtons,
+                                extraGuardLeftTrigger, extraGuardRightTrigger,
+                                extraGuardButtonCount)) {
+        MessageBoxW(window,
+            L"Usa hasta 16 nombres de botón XInput separados por comas (por ejemplo: DPAD_UP, LT, LB).",
+            L"Botones de seguridad", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(window, kSettingsExtraGuardButtons));
+        SendDlgItemMessageW(window, kSettingsExtraGuardButtons, EM_SETSEL, 0, -1);
         return;
     }
 
@@ -2083,6 +2211,9 @@ void SaveSettings(HWND window) {
                              gatherControllerValue.c_str()));
     SetLastError(ERROR_SUCCESS);
     recordWrite(WriteIniText(stagedConfigPath, L"Input", L"extra_guard_keys", extraGuardText));
+    SetLastError(ERROR_SUCCESS);
+    recordWrite(WriteIniText(stagedConfigPath, L"Input", L"extra_guard_buttons",
+                             extraGuardButtonText));
 
     // WritePrivateProfileString returns zero when asked to flush its profile cache,
     // including after a successful flush. Verify the file itself instead of using
@@ -2129,6 +2260,9 @@ void SaveSettings(HWND window) {
     ApplyWheelTiming(timing);
     ApplyExtraGuardKeys(extraGuardKeys, extraGuardKeyCount);
     g_extraGuardKeysText = extraGuardText;
+    ApplyExtraGuardButtons(extraGuardButtons, extraGuardLeftTrigger,
+                           extraGuardRightTrigger);
+    g_extraGuardButtonsText = extraGuardButtonText;
     g_controllerGatherButton.store(selection == 0 ? XINPUT_GAMEPAD_B :
                                    selection == 1 ? XINPUT_GAMEPAD_A :
                                    selection == 2 ? XINPUT_GAMEPAD_X :
@@ -2156,7 +2290,7 @@ void DrawSettingsWindow(HDC dc, const RECT& client) {
     DrawUiCard(dc, RECT{20, 78, client.right - 20, 365});
     RECT wheelHeader{39, 88, 220, 112};
     DrawUiText(dc, L"RUEDA DEL RATÓN", wheelHeader, kUiCyan, g_uiPaintBoldFont);
-    DrawUiCard(dc, RECT{20, 376, client.right - 20, 580});
+    DrawUiCard(dc, RECT{20, 376, client.right - 20, 620});
     RECT controllerHeader{39, 386, client.right - 38, 410};
     DrawUiText(dc, L"MANDO / AUTORECOLECCIÓN", controllerHeader, kUiCyan, g_uiPaintBoldFont);
 
@@ -2182,6 +2316,7 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         CreateSettingsLabel(window, L"Mando permitido", 450);
         CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 481);
         CreateSettingsLabel(window, L"Intervalo entre intentos (200–1000 ms)", 512);
+        CreateSettingsLabel(window, L"Bloqueos extra (CSV)", 543, 42, 170);
 
         const WheelTiming timing = GetWheelTiming();
         HWND controls[] = {
@@ -2229,6 +2364,15 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
         }
         HWND extraGuardEdit = CreateSettingsTextInput(window, kSettingsExtraGuardKeys, 305,
                                                        g_extraGuardKeysText.c_str());
+        HWND extraGuardButtonsEdit = CreateSettingsTextInput(
+            window, kSettingsExtraGuardButtons, 543, g_extraGuardButtonsText.c_str());
+        HWND extraGuardButtonsHint = CreateWindowExW(0, L"STATIC",
+            L"Ejemplos: DPAD_UP, LT, LB, RB, START",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+            ScaleUi(42), ScaleUi(571), ScaleUi(430), ScaleUi(18), window,
+            nullptr, nullptr, nullptr);
+        if (extraGuardButtonsHint != nullptr)
+            SendMessageW(extraGuardButtonsHint, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
         HWND invertCheck = CreateWindowExW(0, L"BUTTON", L"Invertir dirección del scroll",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
             ScaleUi(42), ScaleUi(336), ScaleUi(240), ScaleUi(24), window,
@@ -2238,26 +2382,27 @@ LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LP
 
         HWND notificationsCheck = CreateWindowExW(0, L"BUTTON", L"Avisar al conectar o desconectar mando",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-            ScaleUi(42), ScaleUi(548), ScaleUi(400), ScaleUi(24), window,
+            ScaleUi(42), ScaleUi(590), ScaleUi(400), ScaleUi(24), window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsControllerNotifications)), nullptr, nullptr);
         if (notificationsCheck != nullptr)
             SendMessageW(notificationsCheck, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
 
         HWND defaults = CreateWindowExW(0, L"BUTTON", L"Valores iniciales",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            ScaleUi(20), ScaleUi(590), ScaleUi(148), ScaleUi(42),
+            ScaleUi(20), ScaleUi(626), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsDefaults)), nullptr, nullptr);
         HWND save = CreateWindowExW(0, L"BUTTON", L"Guardar y aplicar",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            ScaleUi(186), ScaleUi(590), ScaleUi(148), ScaleUi(42),
+            ScaleUi(186), ScaleUi(626), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsSave)), nullptr, nullptr);
         HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancelar",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            ScaleUi(352), ScaleUi(590), ScaleUi(148), ScaleUi(42),
+            ScaleUi(352), ScaleUi(626), ScaleUi(148), ScaleUi(42),
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), nullptr, nullptr);
         if (std::any_of(std::begin(controls), std::end(controls), [](HWND control) { return control == nullptr; }) ||
             wheelPresetCombo == nullptr || gatherCombo == nullptr || controllerCombo == nullptr ||
-            extraGuardEdit == nullptr || invertCheck == nullptr || notificationsCheck == nullptr ||
+            extraGuardEdit == nullptr || extraGuardButtonsEdit == nullptr ||
+            extraGuardButtonsHint == nullptr || invertCheck == nullptr || notificationsCheck == nullptr ||
             defaults == nullptr ||
             save == nullptr || cancel == nullptr)
             return -1;

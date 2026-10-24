@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0-preview.10
+
+### Español
+
+- Añade bloqueos XInput configurables para botones, cruceta y gatillos, desde la ventana y el INI. Se suman a las guardas de combate integradas; los gatillos configurados se activan desde 32/255.
+- El diagnóstico copiable informa la configuración de bloqueos extra y cuántos scrolls se descartaron por una acción activa.
+- La ventana de configuración crece para mostrar los nuevos ajustes del mando.
+
+### English
+
+- Adds configurable XInput action guards for buttons, D-pad directions, and triggers through the settings window and INI. They extend the built-in combat guards; configured triggers activate at 32/255.
+- Copied diagnostics report the extra guard configuration and how many wheel events were discarded during an active action.
+- Expands the settings window to fit the additional controller options.
+
 ## 0.1.0-preview.9
 
 ### Español
