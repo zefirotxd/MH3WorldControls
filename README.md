@@ -27,6 +27,8 @@ La aplicación incluye una ventana de estado para comprobar si el juego está en
 - Repite la recolección al mantener F o el botón A lógico del mando: **B en Xbox / Círculo en PlayStation**.
 - Permite cambiar el botón de autorecolección de mando o desactivarlo desde el INI.
 - Deja F8 para pausar o reactivar la rueda y F9 para cerrar el helper.
+- Notifica cuando se conecta o desconecta un mando XInput.
+- Permite configurar desde una ventana los tiempos de la rueda y la autorecolección, y aplica los cambios sin reiniciar.
 
 ### Requisitos
 
@@ -63,7 +65,9 @@ Los tiempos están en `MH3WorldControls.ini`, junto al ejecutable:
 | `release_delay_ms` | 550 ms | 550–1000 ms |
 | `preopen_threshold` | 60 | 0–119 |
 
-Reinicia el helper para aplicar cambios. Los valores más altos hacen la navegación más pausada. Mantén los mínimos de espera y liberación: ayudan a que la selección no se confunda con el uso del objeto.
+Si editas el INI manualmente, reinicia el helper para aplicar los cambios. Los valores más altos hacen la navegación más pausada. Mantén los mínimos de espera y liberación: ayudan a que la selección no se confunda con el uso del objeto.
+
+También puedes abrir **Configuración** en la ventana principal. Edita los valores y pulsa **Guardar y aplicar**; los cambios se escriben en el INI y se aplican en el momento.
 
 En `[Controller]`, `gather_button` elige el botón físico XInput que activa los pulsos de recolección: `A`, `B`, `X`, `Y` u `OFF`. El valor inicial `B` coincide con el botón Este del mapeo predeterminado del juego. `gather_pulse_ms` ajusta la duración de cada toque (50–100 ms) y `gather_interval_ms` el tiempo entre toques (200–1000 ms); el valor inicial de 300 ms conserva el ritmo actual.
 
@@ -107,6 +111,8 @@ The app includes a status window to check game focus and XInput detection, pause
 - Repeat gathering while holding F or the logical Confirm button: **Xbox B / PlayStation Circle**.
 - Configure the XInput gather button or turn controller auto-gather off in the INI.
 - F8 toggles wheel capture; F9 exits the helper.
+- Shows a Windows notification when an XInput controller connects or disconnects.
+- Provides a settings window for wheel and auto-gather timing, with immediate apply.
 
 ### Requirements and setup
 
@@ -116,6 +122,8 @@ The app includes a status window to check game focus and XInput detection, pause
 - The helper only acts while OceanTriRecomp is in the foreground. Run both programs at the same permission level.
 
 The timing values can be edited in `MH3WorldControls.ini` beside the executable. See the Spanish section above for the setting names and supported ranges.
+
+You can also open the settings window from the main window. Edit the values and choose **Guardar y aplicar** to write them to the INI and use them immediately. Manual INI edits require a helper restart.
 
 In `[Controller]`, `gather_button` accepts `A`, `B`, `X`, `Y`, or `OFF`. The default `B` matches the game's default East/Confirm mapping. `gather_pulse_ms` controls tap length (50–100 ms), and `gather_interval_ms` controls the repeat interval (200–1000 ms); the default 300 ms keeps the current pace.
 

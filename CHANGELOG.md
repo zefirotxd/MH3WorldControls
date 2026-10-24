@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-preview.5
+
+- Added Windows notifications when an XInput controller connects or disconnects, including startup detection.
+- Added a full settings window for wheel timing and controller auto-gather options.
+- Settings are validated, saved to the INI, and applied immediately without restarting.
+
 ## 0.1.0-preview.4
 
 - Replaced the console window with a native dark dashboard showing game focus, wheel state, and XInput controller status.

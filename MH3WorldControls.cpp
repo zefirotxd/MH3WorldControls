@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cwchar>
 #include <deque>
 #include <iterator>
 #include <limits>
@@ -23,11 +24,25 @@ using Clock = std::chrono::steady_clock;
 constexpr wchar_t kGameExecutable[] = L"OceanTriRecomp.exe";
 constexpr UINT kWheelDeltaMessage = WM_APP + 0x31;
 constexpr UINT kUiStatusMessage = WM_APP + 0x32;
+constexpr UINT kTrayCallbackMessage = WM_APP + 0x33;
 constexpr int kToggleWheelButton = 1001;
 constexpr int kOpenConfigButton = 1002;
 constexpr int kExitButton = 1003;
 constexpr wchar_t kWindowClassName[] = L"MH3WorldControlsWindow";
-WORD g_controllerGatherButton = XINPUT_GAMEPAD_B;
+constexpr wchar_t kSettingsWindowClassName[] = L"MH3WorldControlsSettingsWindow";
+constexpr UINT_PTR kTrayIconId = 1;
+constexpr int kSettingsGatherButton = 2001;
+constexpr int kSettingsWheelInitialDelay = 2001 + 1;
+constexpr int kSettingsWheelPulse = 2001 + 2;
+constexpr int kSettingsWheelStep = 2001 + 3;
+constexpr int kSettingsWheelRelease = 2001 + 4;
+constexpr int kSettingsPreopenThreshold = 2001 + 5;
+constexpr int kSettingsGatherPulse = 2001 + 6;
+constexpr int kSettingsGatherInterval = 2001 + 7;
+constexpr int kSettingsSave = 2010;
+constexpr int kSettingsDefaults = 2011;
+constexpr int kSettingsCancel = 2012;
+std::atomic<WORD> g_controllerGatherButton{XINPUT_GAMEPAD_B};
 
 struct WheelTiming {
     DWORD initialDelayMs = 300;
@@ -54,9 +69,11 @@ std::atomic<ULONGLONG> g_wheelReleaseAt{0};
 std::atomic<ULONGLONG> g_wheelReadyAt{0};
 std::atomic<DWORD> g_gameProcessId{0};
 std::atomic<DWORD> g_connectedControllerCount{0};
+std::atomic<DWORD> g_connectedControllerMask{0};
 std::mutex g_wheelMutex;
 std::mutex g_foregroundCacheMutex;
 std::mutex g_statusMutex;
+std::mutex g_settingsMutex;
 std::deque<WORD> g_wheelDirections;
 std::wstring g_configPath;
 std::wstring g_latestLog;
@@ -68,9 +85,16 @@ bool g_cachedForegroundIsGame = false;
 Clock::time_point g_foregroundCacheUpdatedAt{};
 DWORD g_mainThreadId = 0;
 HWND g_mainWindow = nullptr;
+HWND g_settingsWindow = nullptr;
 HWND g_toggleWheelControl = nullptr;
 HFONT g_uiFont = nullptr;
 HFONT g_uiBoldFont = nullptr;
+HBRUSH g_settingsEditBrush = nullptr;
+HBRUSH g_settingsListBrush = nullptr;
+NOTIFYICONDATAW g_trayIconData{};
+bool g_trayIconAdded = false;
+bool g_controllerStateInitialized = false;
+DWORD g_lastNotifiedControllerMask = 0;
 bool g_wheelHotkeyRegistered = false;
 bool g_exitHotkeyRegistered = false;
 HHOOK g_keyboardHook = nullptr;
@@ -86,6 +110,16 @@ constexpr WORD kMouseRightAction = 0xFFFF;
 constexpr ULONG_PTR kWheelActionTag = 0x4D483357; // "MH3W"
 
 void Log(const std::string& message);
+
+WheelTiming GetWheelTiming() {
+    std::lock_guard<std::mutex> lock(g_settingsMutex);
+    return g_wheelTiming;
+}
+
+void ApplyWheelTiming(const WheelTiming& timing) {
+    std::lock_guard<std::mutex> lock(g_settingsMutex);
+    g_wheelTiming = timing;
+}
 
 void LoadWheelTiming() {
     wchar_t executablePath[MAX_PATH]{};
@@ -324,6 +358,7 @@ XInputHeldActions ReadXInputHeldActions() {
     XInputHeldActions held;
     if (g_xinputGetState == nullptr) {
         g_connectedControllerCount.store(0, std::memory_order_release);
+        g_connectedControllerMask.store(0, std::memory_order_release);
         return held;
     }
 
@@ -339,6 +374,7 @@ XInputHeldActions ReadXInputHeldActions() {
                                    XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK |
                                    XINPUT_GAMEPAD_LEFT_THUMB |
                                    XINPUT_GAMEPAD_RIGHT_THUMB;
+    const WORD gatherButton = g_controllerGatherButton.load(std::memory_order_acquire);
     for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex) {
         // Keep connected pads responsive at the worker's normal rate, but avoid
         // polling empty XInput slots every 5 ms. Discover new pads every 2 s.
@@ -360,14 +396,19 @@ XInputHeldActions ReadXInputHeldActions() {
             (rightShoulderHeld && !moving) || pad.bRightTrigger >= 32) {
             held.gameplayAction = true;
         }
-        if (g_controllerGatherButton != 0 &&
-            (pad.wButtons & g_controllerGatherButton) != 0) {
+        if (gatherButton != 0 && (pad.wButtons & gatherButton) != 0) {
             held.pickupButton = true;
         }
     }
     const DWORD connectedCount = static_cast<DWORD>(
         std::count(g_xinputConnected.begin(), g_xinputConnected.end(), true));
+    DWORD connectedMask = 0;
+    for (DWORD userIndex = 0; userIndex < XUSER_MAX_COUNT; ++userIndex) {
+        if (g_xinputConnected[userIndex])
+            connectedMask |= 1u << userIndex;
+    }
     g_connectedControllerCount.store(connectedCount, std::memory_order_release);
+    g_connectedControllerMask.store(connectedMask, std::memory_order_release);
     return held;
 }
 
@@ -477,6 +518,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM message, LPARAM data) {
 }
 
 bool DiscardPendingWheelInputLocked(bool force) {
+    const WheelTiming timing = GetWheelTiming();
     const bool hasPendingInput = force || !g_wheelDirections.empty() || g_pendingWheelDelta != 0 ||
                                  g_wheelModifierPending.load(std::memory_order_acquire);
     if (!hasPendingInput)
@@ -492,7 +534,7 @@ bool DiscardPendingWheelInputLocked(bool force) {
     if (modifierWasInjected || deferredRelease) {
         // Let an already-open bar close safely. Do not preserve any item steps.
         g_wheelBusy = true;
-        const ULONGLONG delay = modifierWasInjected ? g_wheelTiming.releaseDelayMs : 0;
+        const ULONGLONG delay = modifierWasInjected ? timing.releaseDelayMs : 0;
         g_wheelReleaseAt.store(GetTickCount64() + delay, std::memory_order_release);
     } else {
         g_wheelBusy = false;
@@ -516,6 +558,8 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
         DiscardPendingWheelInput(true);
         return;
     }
+
+    const WheelTiming timing = GetWheelTiming();
 
     bool queuedSelection = false;
     bool injectModifier = false;
@@ -543,8 +587,8 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
             g_wheelBusy = true;
         if (g_wheelDirections.size() >= 8 && std::abs(g_pendingWheelDelta) >= WHEEL_DELTA)
             g_pendingWheelDelta = 0;
-        const bool preopenPartial = g_wheelTiming.preopenThreshold > 0 &&
-                                    std::abs(g_pendingWheelDelta) >= int(g_wheelTiming.preopenThreshold);
+        const bool preopenPartial = timing.preopenThreshold > 0 &&
+                                    std::abs(g_pendingWheelDelta) >= int(timing.preopenThreshold);
         if (queuedSelection || preopenPartial)
             g_wheelBusy = true;
         if (!queuedSelection && !preopenPartial &&
@@ -575,7 +619,7 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
                 }
                 g_wheelReadyAt.store(std::numeric_limits<ULONGLONG>::max(), std::memory_order_release);
             }
-            g_wheelReleaseAt.store(GetTickCount64() + g_wheelTiming.releaseDelayMs,
+            g_wheelReleaseAt.store(GetTickCount64() + timing.releaseDelayMs,
                                    std::memory_order_release);
         }
     }
@@ -589,7 +633,7 @@ void HandleWheelDelta(SHORT delta, bool actionHeldAtScroll) {
             if (g_wheelBusy && g_wheelModifierInjected.load(std::memory_order_acquire)) {
                 const ULONGLONG delay = g_itemKeyHeld.load(std::memory_order_acquire)
                                             ? 0
-                                            : g_wheelTiming.initialDelayMs;
+                                            : timing.initialDelayMs;
                 g_wheelReadyAt.store(GetTickCount64() + delay, std::memory_order_release);
             }
         } else {
@@ -635,6 +679,7 @@ void PickupWorker() {
 
     while (g_running.load(std::memory_order_acquire)) {
         const auto now = Clock::now();
+        const WheelTiming timing = GetWheelTiming();
         const bool gameFocused = IsGameForeground();
         const XInputHeldActions xinput = gameFocused ? ReadXInputHeldActions() : XInputHeldActions{};
         g_controllerActionHeld.store(xinput.gameplayAction,
@@ -701,10 +746,10 @@ void PickupWorker() {
                     if (g_wheelBusy && g_wheelModifierInjected.load(std::memory_order_acquire)) {
                         const ULONGLONG delay = g_itemKeyHeld.load(std::memory_order_acquire)
                                                     ? 0
-                                                    : g_wheelTiming.initialDelayMs;
+                                                    : timing.initialDelayMs;
                         const ULONGLONG nowTick = GetTickCount64();
                         g_wheelReadyAt.store(nowTick + delay, std::memory_order_release);
-                        g_wheelReleaseAt.store(nowTick + g_wheelTiming.releaseDelayMs,
+                        g_wheelReleaseAt.store(nowTick + timing.releaseDelayMs,
                                                std::memory_order_release);
                     }
                 } else {
@@ -779,8 +824,8 @@ void PickupWorker() {
                                                         : SendKey(activeWheelKey, true, true));
                     if (sent) {
                         wheelArrowPressed = true;
-                        releaseWheelArrow = now + std::chrono::milliseconds(g_wheelTiming.pulseMs);
-                        nextWheelPress = now + std::chrono::milliseconds(g_wheelTiming.stepIntervalMs);
+                        releaseWheelArrow = now + std::chrono::milliseconds(timing.pulseMs);
+                        nextWheelPress = now + std::chrono::milliseconds(timing.stepIntervalMs);
                     } else {
                         activeWheelKey = 0;
                         activeWheelMouse = false;
@@ -833,8 +878,8 @@ void PickupWorker() {
         } else if (!pickupPressed && now >= nextPickup && IsGameForeground()) {
             pickupPressed = SendKey('F', true);
             if (pickupPressed)
-                releasePickup = now + std::chrono::milliseconds(g_wheelTiming.gatherPulseMs);
-            nextPickup = now + std::chrono::milliseconds(g_wheelTiming.gatherIntervalMs);
+                releasePickup = now + std::chrono::milliseconds(timing.gatherPulseMs);
+            nextPickup = now + std::chrono::milliseconds(timing.gatherIntervalMs);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -902,20 +947,6 @@ void ToggleWheel() {
         InvalidateRect(g_mainWindow, nullptr, FALSE);
 }
 
-void OpenConfigFile() {
-    if (g_configPath.empty()) {
-        MessageBoxW(g_mainWindow, L"No se encontró MH3WorldControls.ini junto al helper.",
-                    L"Configuración", MB_OK | MB_ICONWARNING);
-        return;
-    }
-    const std::wstring arguments = L"\"" + g_configPath + L"\"";
-    const auto result = reinterpret_cast<INT_PTR>(
-        ShellExecuteW(g_mainWindow, L"open", L"notepad.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL));
-    if (result <= 32)
-        MessageBoxW(g_mainWindow, L"No se pudo abrir MH3WorldControls.ini.",
-                    L"Configuración", MB_OK | MB_ICONERROR);
-}
-
 void ShowWindowsError(const wchar_t* action) {
     const DWORD errorCode = GetLastError();
     std::wstring message(action);
@@ -924,7 +955,73 @@ void ShowWindowsError(const wchar_t* action) {
     MessageBoxW(g_mainWindow, message.c_str(), L"MH3 World Controls", MB_OK | MB_ICONERROR);
 }
 
+void AddTrayIcon(HWND window) {
+    g_trayIconData = {};
+    g_trayIconData.cbSize = sizeof(g_trayIconData);
+    g_trayIconData.hWnd = window;
+    g_trayIconData.uID = kTrayIconId;
+    g_trayIconData.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_trayIconData.uCallbackMessage = kTrayCallbackMessage;
+    g_trayIconData.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    wcscpy_s(g_trayIconData.szTip, L"MH3 World Controls");
+    g_trayIconAdded = Shell_NotifyIconW(NIM_ADD, &g_trayIconData) != FALSE;
+}
+
+void NotifyControllerChange(bool connected, DWORD count) {
+    std::wstring title;
+    std::wstring message;
+    if (connected) {
+        title = L"Mando conectado";
+        message = count == 1 ? L"XInput está listo. Mantén B / Círculo para recolectar."
+                             : L"Se detectó otro mando XInput.";
+    } else {
+        title = L"Mando desconectado";
+        message = count == 0 ? L"No hay mandos XInput conectados."
+                             : L"Quedan mandos XInput conectados.";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_statusMutex);
+        g_latestLog = title + L": " + message;
+    }
+    if (g_mainWindow != nullptr)
+        PostMessageW(g_mainWindow, kUiStatusMessage, 0, 0);
+
+    if (g_trayIconAdded) {
+        NOTIFYICONDATAW notification = g_trayIconData;
+        notification.uFlags = NIF_INFO;
+        notification.dwInfoFlags = NIIF_INFO;
+        notification.uTimeout = 5000;
+        wcscpy_s(notification.szInfoTitle, title.c_str());
+        wcscpy_s(notification.szInfo, message.c_str());
+        Shell_NotifyIconW(NIM_MODIFY, &notification);
+    }
+}
+
+void CheckControllerConnectionChange() {
+    ReadXInputHeldActions();
+    const DWORD currentMask = g_connectedControllerMask.load(std::memory_order_acquire);
+    const DWORD currentCount = g_connectedControllerCount.load(std::memory_order_acquire);
+    if (!g_controllerStateInitialized) {
+        g_controllerStateInitialized = true;
+        if (currentMask != 0)
+            NotifyControllerChange(true, currentCount);
+    } else if (currentMask != g_lastNotifiedControllerMask) {
+        const bool connected = (currentMask & ~g_lastNotifiedControllerMask) != 0;
+        NotifyControllerChange(connected, currentCount);
+    }
+    g_lastNotifiedControllerMask = currentMask;
+}
+
+void RemoveTrayIcon() {
+    if (g_trayIconAdded) {
+        Shell_NotifyIconW(NIM_DELETE, &g_trayIconData);
+        g_trayIconAdded = false;
+    }
+}
+
 void DrawMainWindow(HDC dc, const RECT& client) {
+    const WheelTiming timing = GetWheelTiming();
     HBRUSH background = CreateSolidBrush(kUiBackground);
     FillRect(dc, &client, background);
     DeleteObject(background);
@@ -984,12 +1081,13 @@ void DrawMainWindow(HDC dc, const RECT& client) {
                controllerCount > 0 ? kUiGreen : kUiText, g_uiBoldFont);
     RECT controllerDetail{middle + 26, 303, client.right - 42, 326};
     wchar_t gatherDetail[128]{};
-    const wchar_t* gatherButton = g_controllerGatherButton == XINPUT_GAMEPAD_A ? L"A" :
-                                  g_controllerGatherButton == XINPUT_GAMEPAD_B ? L"B / Círculo" :
-                                  g_controllerGatherButton == XINPUT_GAMEPAD_X ? L"X" :
-                                  g_controllerGatherButton == XINPUT_GAMEPAD_Y ? L"Y" : L"Desactivada";
+    const WORD gatherButtonMask = g_controllerGatherButton.load(std::memory_order_acquire);
+    const wchar_t* gatherButton = gatherButtonMask == XINPUT_GAMEPAD_A ? L"A" :
+                                  gatherButtonMask == XINPUT_GAMEPAD_B ? L"B / Círculo" :
+                                  gatherButtonMask == XINPUT_GAMEPAD_X ? L"X" :
+                                  gatherButtonMask == XINPUT_GAMEPAD_Y ? L"Y" : L"Desactivada";
     swprintf_s(gatherDetail, L"%s · cada %lu ms", gatherButton,
-               static_cast<unsigned long>(g_wheelTiming.gatherIntervalMs));
+               static_cast<unsigned long>(timing.gatherIntervalMs));
     DrawUiText(dc, gatherDetail, controllerDetail, kUiMuted, g_uiFont);
 
     RECT settingsCard{25, 352, client.right - 25, 433};
@@ -999,12 +1097,12 @@ void DrawMainWindow(HDC dc, const RECT& client) {
     RECT settingsDetail{44, 390, client.right - 44, 410};
     wchar_t settingsText[160]{};
     swprintf_s(settingsText, L"Rueda: %lu ms por paso  ·  Recolección: pulso %lu ms / intervalo %lu ms",
-               static_cast<unsigned long>(g_wheelTiming.stepIntervalMs),
-               static_cast<unsigned long>(g_wheelTiming.gatherPulseMs),
-               static_cast<unsigned long>(g_wheelTiming.gatherIntervalMs));
+               static_cast<unsigned long>(timing.stepIntervalMs),
+               static_cast<unsigned long>(timing.gatherPulseMs),
+               static_cast<unsigned long>(timing.gatherIntervalMs));
     DrawUiText(dc, settingsText, settingsDetail, kUiText, g_uiFont);
     RECT settingsHint{44, 411, client.right - 44, 429};
-    DrawUiText(dc, L"Edita el INI y reinicia el helper para aplicar cambios.",
+    DrawUiText(dc, L"La ventana de configuración guarda y aplica los cambios al instante.",
                settingsHint, kUiMuted, g_uiFont);
 
     std::wstring latestLog;
@@ -1019,6 +1117,356 @@ void DrawMainWindow(HDC dc, const RECT& client) {
                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
+void CreateSettingsLabel(HWND window, const wchar_t* text, int y) {
+    const HWND label = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        42, y, 295, 26, window, nullptr, nullptr, nullptr);
+    if (label != nullptr)
+        SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+}
+
+HWND CreateSettingsEdit(HWND window, int id, int y, DWORD value) {
+    const std::wstring text = std::to_wstring(value);
+    const HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
+        356, y, 112, 27, window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
+    if (edit != nullptr)
+        SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+    return edit;
+}
+
+void SetSettingsDefaults(HWND window) {
+    SetDlgItemInt(window, kSettingsWheelInitialDelay, 300, FALSE);
+    SetDlgItemInt(window, kSettingsWheelPulse, 50, FALSE);
+    SetDlgItemInt(window, kSettingsWheelStep, 150, FALSE);
+    SetDlgItemInt(window, kSettingsWheelRelease, 550, FALSE);
+    SetDlgItemInt(window, kSettingsPreopenThreshold, 60, FALSE);
+    SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, 0, 0);
+    SetDlgItemInt(window, kSettingsGatherPulse, 60, FALSE);
+    SetDlgItemInt(window, kSettingsGatherInterval, 300, FALSE);
+}
+
+void PopulateSettings(HWND window) {
+    const WheelTiming timing = GetWheelTiming();
+    SetDlgItemInt(window, kSettingsWheelInitialDelay, timing.initialDelayMs, FALSE);
+    SetDlgItemInt(window, kSettingsWheelPulse, timing.pulseMs, FALSE);
+    SetDlgItemInt(window, kSettingsWheelStep, timing.stepIntervalMs, FALSE);
+    SetDlgItemInt(window, kSettingsWheelRelease, timing.releaseDelayMs, FALSE);
+    SetDlgItemInt(window, kSettingsPreopenThreshold, timing.preopenThreshold, FALSE);
+    SetDlgItemInt(window, kSettingsGatherPulse, timing.gatherPulseMs, FALSE);
+    SetDlgItemInt(window, kSettingsGatherInterval, timing.gatherIntervalMs, FALSE);
+
+    const WORD button = g_controllerGatherButton.load(std::memory_order_acquire);
+    const WPARAM selection = button == XINPUT_GAMEPAD_B ? 0 :
+                             button == XINPUT_GAMEPAD_A ? 1 :
+                             button == XINPUT_GAMEPAD_X ? 2 :
+                             button == XINPUT_GAMEPAD_Y ? 3 : 4;
+    SendDlgItemMessageW(window, kSettingsGatherButton, CB_SETCURSEL, selection, 0);
+}
+
+bool ReadSettingsNumber(HWND window, int id, DWORD minimum, DWORD maximum,
+                         const wchar_t* settingName, DWORD& value) {
+    BOOL translated = FALSE;
+    const UINT input = GetDlgItemInt(window, id, &translated, FALSE);
+    if (!translated || input < minimum || input > maximum) {
+        std::wstring message = settingName;
+        message += L" debe estar entre ";
+        message += std::to_wstring(minimum);
+        message += L" y ";
+        message += std::to_wstring(maximum);
+        message += L".";
+        MessageBoxW(window, message.c_str(), L"Valor fuera de rango", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(window, id));
+        SendDlgItemMessageW(window, id, EM_SETSEL, 0, -1);
+        return false;
+    }
+    value = input;
+    return true;
+}
+
+bool WriteIniNumber(const wchar_t* section, const wchar_t* key, DWORD value) {
+    const std::wstring text = std::to_wstring(value);
+    return WritePrivateProfileStringW(section, key, text.c_str(), g_configPath.c_str()) != FALSE;
+}
+
+void SaveSettings(HWND window) {
+    if (g_configPath.empty()) {
+        MessageBoxW(window, L"No se encontró MH3WorldControls.ini junto al helper.",
+                    L"Configuración", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    WheelTiming timing = GetWheelTiming();
+    if (!ReadSettingsNumber(window, kSettingsWheelInitialDelay, 300, 1000,
+                             L"La espera inicial", timing.initialDelayMs) ||
+        !ReadSettingsNumber(window, kSettingsWheelPulse, 50, 100,
+                             L"El pulso de la rueda", timing.pulseMs) ||
+        !ReadSettingsNumber(window, kSettingsWheelStep, 100, 600,
+                             L"El intervalo de la rueda", timing.stepIntervalMs) ||
+        !ReadSettingsNumber(window, kSettingsWheelRelease, 550, 1000,
+                             L"La espera de cierre", timing.releaseDelayMs) ||
+        !ReadSettingsNumber(window, kSettingsPreopenThreshold, 0, WHEEL_DELTA - 1,
+                             L"La preapertura", timing.preopenThreshold) ||
+        !ReadSettingsNumber(window, kSettingsGatherPulse, 50, 100,
+                             L"El pulso de recolección", timing.gatherPulseMs) ||
+        !ReadSettingsNumber(window, kSettingsGatherInterval, 200, 1000,
+                             L"El intervalo de recolección", timing.gatherIntervalMs))
+        return;
+
+    if (timing.stepIntervalMs < timing.pulseMs) {
+        MessageBoxW(window, L"El intervalo de la rueda no puede ser menor que la duración del pulso.",
+                    L"Revisa los tiempos", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(window, kSettingsWheelStep));
+        return;
+    }
+    if (timing.gatherIntervalMs < timing.gatherPulseMs) {
+        MessageBoxW(window, L"El intervalo de recolección no puede ser menor que la duración del pulso.",
+                    L"Revisa los tiempos", MB_OK | MB_ICONWARNING);
+        SetFocus(GetDlgItem(window, kSettingsGatherInterval));
+        return;
+    }
+
+    const LRESULT selection = SendDlgItemMessageW(window, kSettingsGatherButton, CB_GETCURSEL, 0, 0);
+    if (selection == CB_ERR) {
+        MessageBoxW(window, L"Selecciona un botón de mando válido.",
+                    L"Configuración", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    const wchar_t* buttonValue = selection == 0 ? L"B" :
+                                 selection == 1 ? L"A" :
+                                 selection == 2 ? L"X" :
+                                 selection == 3 ? L"Y" : L"OFF";
+
+    bool saved = true;
+    saved = WriteIniNumber(L"Wheel", L"initial_delay_ms", timing.initialDelayMs) && saved;
+    saved = WriteIniNumber(L"Wheel", L"pulse_ms", timing.pulseMs) && saved;
+    saved = WriteIniNumber(L"Wheel", L"step_interval_ms", timing.stepIntervalMs) && saved;
+    saved = WriteIniNumber(L"Wheel", L"release_delay_ms", timing.releaseDelayMs) && saved;
+    saved = WriteIniNumber(L"Wheel", L"preopen_threshold", timing.preopenThreshold) && saved;
+    saved = WritePrivateProfileStringW(L"Controller", L"gather_button", buttonValue,
+                                       g_configPath.c_str()) != FALSE && saved;
+    saved = WriteIniNumber(L"Controller", L"gather_pulse_ms", timing.gatherPulseMs) && saved;
+    saved = WriteIniNumber(L"Controller", L"gather_interval_ms", timing.gatherIntervalMs) && saved;
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, g_configPath.c_str());
+    if (!saved) {
+        MessageBoxW(window, L"No se pudieron guardar todos los valores. Comprueba los permisos del INI.",
+                    L"Error al guardar", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    ApplyWheelTiming(timing);
+    g_controllerGatherButton.store(selection == 0 ? XINPUT_GAMEPAD_B :
+                                   selection == 1 ? XINPUT_GAMEPAD_A :
+                                   selection == 2 ? XINPUT_GAMEPAD_X :
+                                   selection == 3 ? XINPUT_GAMEPAD_Y : 0,
+                                   std::memory_order_release);
+    Log("Configuracion guardada y aplicada sin reiniciar.");
+    if (g_mainWindow != nullptr)
+        InvalidateRect(g_mainWindow, nullptr, FALSE);
+    DestroyWindow(window);
+}
+
+void DrawSettingsWindow(HDC dc, const RECT& client) {
+    HBRUSH background = CreateSolidBrush(kUiBackground);
+    FillRect(dc, &client, background);
+    DeleteObject(background);
+
+    RECT title{24, 17, client.right - 24, 48};
+    DrawUiText(dc, L"Configuración", title, kUiText, g_uiBoldFont);
+    RECT subtitle{25, 47, client.right - 24, 69};
+    DrawUiText(dc, L"Ajusta los controles y aplica sin reiniciar", subtitle, kUiMuted, g_uiFont);
+
+    DrawUiCard(dc, RECT{20, 78, client.right - 20, 292});
+    RECT wheelHeader{39, 88, client.right - 38, 112};
+    DrawUiText(dc, L"RUEDA DEL RATÓN", wheelHeader, kUiCyan, g_uiBoldFont);
+    DrawUiCard(dc, RECT{20, 303, client.right - 20, 452});
+    RECT controllerHeader{39, 313, client.right - 38, 337};
+    DrawUiText(dc, L"MANDO / AUTORECOLECCIÓN", controllerHeader, kUiCyan, g_uiBoldFont);
+
+    RECT footer{23, client.bottom - 27, client.right - 23, client.bottom - 7};
+    DrawUiText(dc, L"Los valores se guardan en MH3WorldControls.ini.", footer, kUiMuted, g_uiFont);
+}
+
+LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        CreateSettingsLabel(window, L"Espera inicial (300–1000 ms)", 119);
+        CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 150);
+        CreateSettingsLabel(window, L"Intervalo entre pasos (100–600 ms)", 181);
+        CreateSettingsLabel(window, L"Espera para cerrar (550–1000 ms)", 212);
+        CreateSettingsLabel(window, L"Preapertura de la rueda (0–119)", 243);
+        CreateSettingsLabel(window, L"Botón de recolección", 346);
+        CreateSettingsLabel(window, L"Duración del pulso (50–100 ms)", 377);
+        CreateSettingsLabel(window, L"Intervalo entre intentos (200–1000 ms)", 408);
+
+        const WheelTiming timing = GetWheelTiming();
+        HWND controls[] = {
+            CreateSettingsEdit(window, kSettingsWheelInitialDelay, 118, timing.initialDelayMs),
+            CreateSettingsEdit(window, kSettingsWheelPulse, 149, timing.pulseMs),
+            CreateSettingsEdit(window, kSettingsWheelStep, 180, timing.stepIntervalMs),
+            CreateSettingsEdit(window, kSettingsWheelRelease, 211, timing.releaseDelayMs),
+            CreateSettingsEdit(window, kSettingsPreopenThreshold, 242, timing.preopenThreshold),
+            CreateSettingsEdit(window, kSettingsGatherPulse, 376, timing.gatherPulseMs),
+            CreateSettingsEdit(window, kSettingsGatherInterval, 407, timing.gatherIntervalMs)
+        };
+        HWND gatherCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            356, 344, 112, 150, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsGatherButton)), nullptr, nullptr);
+        if (gatherCombo != nullptr) {
+            const wchar_t* buttons[] = {L"B / Círculo", L"A", L"X", L"Y", L"Desactivar"};
+            for (const wchar_t* button : buttons)
+                SendMessageW(gatherCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(button));
+            SendMessageW(gatherCombo, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+        }
+
+        HWND defaults = CreateWindowExW(0, L"BUTTON", L"Valores iniciales",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 20, 473, 148, 42,
+            window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsDefaults)), nullptr, nullptr);
+        HWND save = CreateWindowExW(0, L"BUTTON", L"Guardar y aplicar",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 186, 473, 148, 42,
+            window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsSave)), nullptr, nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", L"Cancelar",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 352, 473, 148, 42,
+            window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsCancel)), nullptr, nullptr);
+        if (std::any_of(std::begin(controls), std::end(controls), [](HWND control) { return control == nullptr; }) ||
+            gatherCombo == nullptr || defaults == nullptr || save == nullptr || cancel == nullptr)
+            return -1;
+
+        for (HWND control : {defaults, save, cancel})
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiBoldFont), TRUE);
+        PopulateSettings(window);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        DrawSettingsWindow(dc, client);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+        SetTextColor(reinterpret_cast<HDC>(wParam), kUiText);
+        SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
+        return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        SetTextColor(reinterpret_cast<HDC>(wParam), kUiText);
+        SetBkColor(reinterpret_cast<HDC>(wParam), kUiPanelRaised);
+        return reinterpret_cast<LRESULT>(message == WM_CTLCOLOREDIT ?
+                                          g_settingsEditBrush : g_settingsListBrush);
+    case WM_DRAWITEM: {
+        const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (item == nullptr)
+            break;
+        const bool primary = item->CtlID == kSettingsSave;
+        const bool hot = (item->itemState & ODS_HOTLIGHT) != 0;
+        const COLORREF fill = primary ? (hot ? RGB(48, 218, 255) : RGB(21, 172, 218))
+                                      : (hot ? RGB(30, 57, 82) : kUiPanelRaised);
+        HBRUSH brush = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, primary ? kUiCyan : kUiBorder);
+        HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
+        HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+        RoundRect(item->hDC, item->rcItem.left, item->rcItem.top,
+                  item->rcItem.right, item->rcItem.bottom, 10, 10);
+        wchar_t label[80]{};
+        GetWindowTextW(item->hwndItem, label, static_cast<int>(std::size(label)));
+        RECT textRect = item->rcItem;
+        InflateRect(&textRect, -5, 0);
+        DrawUiText(item->hDC, label, textRect, kUiText, g_uiBoldFont,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(item->hDC, oldBrush);
+        SelectObject(item->hDC, oldPen);
+        DeleteObject(brush);
+        DeleteObject(pen);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case kSettingsSave:
+            SaveSettings(window);
+            return 0;
+        case kSettingsDefaults:
+            SetSettingsDefaults(window);
+            return 0;
+        case kSettingsCancel:
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+    case WM_DESTROY:
+        if (g_settingsEditBrush != nullptr) {
+            DeleteObject(g_settingsEditBrush);
+            g_settingsEditBrush = nullptr;
+        }
+        if (g_settingsListBrush != nullptr) {
+            DeleteObject(g_settingsListBrush);
+            g_settingsListBrush = nullptr;
+        }
+        g_settingsWindow = nullptr;
+        if (g_mainWindow != nullptr)
+            InvalidateRect(g_mainWindow, nullptr, FALSE);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void OpenSettingsWindow() {
+    if (g_settingsWindow != nullptr) {
+        ShowWindow(g_settingsWindow, SW_SHOWNORMAL);
+        SetForegroundWindow(g_settingsWindow);
+        return;
+    }
+
+    static bool settingsClassRegistered = false;
+    if (!settingsClassRegistered) {
+        WNDCLASSEXW settingsClass{};
+        settingsClass.cbSize = sizeof(settingsClass);
+        settingsClass.style = CS_HREDRAW | CS_VREDRAW;
+        settingsClass.lpfnWndProc = SettingsWindowProc;
+        settingsClass.hInstance = GetModuleHandleW(nullptr);
+        settingsClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        settingsClass.lpszClassName = kSettingsWindowClassName;
+        if (RegisterClassExW(&settingsClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            ShowWindowsError(L"No se pudo registrar la ventana de configuración.");
+            return;
+        }
+        settingsClassRegistered = true;
+    }
+
+    g_settingsEditBrush = CreateSolidBrush(kUiPanelRaised);
+    g_settingsListBrush = CreateSolidBrush(kUiPanelRaised);
+    constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT bounds{0, 0, 520, 555};
+    AdjustWindowRect(&bounds, style, FALSE);
+    g_settingsWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, kSettingsWindowClassName,
+        L"MH3 World Controls · Configuración", style, CW_USEDEFAULT, CW_USEDEFAULT,
+        bounds.right - bounds.left, bounds.bottom - bounds.top,
+        g_mainWindow, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (g_settingsWindow == nullptr) {
+        if (g_settingsEditBrush != nullptr) {
+            DeleteObject(g_settingsEditBrush);
+            g_settingsEditBrush = nullptr;
+        }
+        if (g_settingsListBrush != nullptr) {
+            DeleteObject(g_settingsListBrush);
+            g_settingsListBrush = nullptr;
+        }
+        ShowWindowsError(L"No se pudo abrir la ventana de configuración.");
+        return;
+    }
+    ShowWindow(g_settingsWindow, SW_SHOWNORMAL);
+    UpdateWindow(g_settingsWindow);
+    SetForegroundWindow(g_settingsWindow);
+}
+
 LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
@@ -1031,7 +1479,7 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         g_toggleWheelControl = CreateWindowExW(0, L"BUTTON", L"Pausar rueda",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 25, 454, 215, 48,
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kToggleWheelButton)), nullptr, nullptr);
-        const HWND configControl = CreateWindowExW(0, L"BUTTON", L"Abrir configuración",
+        const HWND configControl = CreateWindowExW(0, L"BUTTON", L"Configuración",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 252, 454, 215, 48,
             window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kOpenConfigButton)), nullptr, nullptr);
         const HWND exitControl = CreateWindowExW(0, L"BUTTON", L"Cerrar helper",
@@ -1045,6 +1493,7 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
             if (control != nullptr)
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiBoldFont), TRUE);
         }
+        AddTrayIcon(window);
         SetTimer(window, 1, 250, nullptr);
         return 0;
     }
@@ -1091,7 +1540,7 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
             ToggleWheel();
             return 0;
         case kOpenConfigButton:
-            OpenConfigFile();
+            OpenSettingsWindow();
             return 0;
         case kExitButton:
             PostMessageW(window, WM_CLOSE, 0, 0);
@@ -1100,7 +1549,7 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         break;
     case WM_TIMER:
         if (wParam == 1) {
-            ReadXInputHeldActions(); // Keep the connection indicator current while the game is unfocused.
+            CheckControllerConnectionChange();
             InvalidateRect(window, nullptr, FALSE);
         }
         return 0;
@@ -1117,12 +1566,22 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
             return 0;
         }
         break;
+    case kTrayCallbackMessage:
+        if (lParam == WM_LBUTTONDBLCLK) {
+            ShowWindow(window, SW_SHOWNORMAL);
+            SetForegroundWindow(window);
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
         g_running.store(false, std::memory_order_release);
         KillTimer(window, 1);
+        if (g_settingsWindow != nullptr)
+            DestroyWindow(g_settingsWindow);
+        RemoveTrayIcon();
         if (g_exitHotkeyRegistered) {
             UnregisterHotKey(window, 1);
             g_exitHotkeyRegistered = false;
