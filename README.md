@@ -34,6 +34,7 @@ La aplicación incluye una ventana de estado para comprobar si el juego está en
 - Muestra cuántos pasos de scroll esperan o se descartaron por el límite seguro de cola. La captura de entradas usa un hilo separado de la interfaz.
 - Copia un diagnóstico técnico al portapapeles sin incluir rutas personales. La versión también aparece en las propiedades del ejecutable.
 - Permite silenciar los avisos de conexión del mando sin ocultar su estado en la ventana. La interfaz escala con el DPI de Windows.
+- La ventana confirma en vivo si detecta el botón de recolección configurado y si los pulsos están activos; el diagnóstico copia también el puerto XInput que lo está enviando.
 - El aviso del mando respeta el botón de autorecolección elegido. El icono de bandeja permite abrir la ventana con un clic y ofrece un menú con configuración, rueda y cierre.
 
 ### Requisitos
@@ -131,6 +132,7 @@ The app includes a status window to check game focus and XInput detection, pause
 - Lets you tune wheel sensitivity and direction, add up to eight action-guard keys, and see pending or dropped scroll steps.
 - Keeps low-level input capture on a dedicated thread and provides privacy-conscious diagnostics in the clipboard.
 - Lets you mute controller notices while retaining the live status panel, and scales the interface for Windows display DPI.
+- Shows live feedback when the configured gather button is detected and when auto-gather pulses are active; copied diagnostics include the XInput slot sending it.
 - The tray icon opens the main window on click and provides a menu for settings, wheel control, and exit.
 
 ### Requirements and setup

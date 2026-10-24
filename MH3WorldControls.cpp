@@ -58,7 +58,7 @@ constexpr int kTrayToggleWheel = 3003;
 constexpr int kTrayExit = 3004;
 constexpr int kTrayCopyDiagnostics = 3005;
 constexpr int kCopyDiagnosticsButton = 1004;
-constexpr wchar_t kAppVersion[] = L"0.1.0-preview.8";
+constexpr wchar_t kAppVersion[] = L"0.1.0-preview.9";
 constexpr int kMainLogicalWidth = 720;
 constexpr int kMainLogicalHeight = 540;
 constexpr int kSettingsLogicalWidth = 520;
@@ -102,6 +102,7 @@ std::atomic<ULONGLONG> g_wheelReadyAt{0};
 std::atomic<DWORD> g_gameProcessId{0};
 std::atomic<DWORD> g_connectedControllerCount{0};
 std::atomic<DWORD> g_connectedControllerMask{0};
+std::atomic<DWORD> g_gatherButtonHeldMask{0};
 std::atomic<DWORD> g_droppedWheelSteps{0};
 std::mutex g_wheelMutex;
 std::mutex g_foregroundCacheMutex;
@@ -760,6 +761,7 @@ void LoadXInput() {
 struct XInputHeldActions {
     bool gameplayAction = false;
     bool pickupButton = false;
+    DWORD gatherButtonMask = 0;
 };
 
 XInputHeldActions ReadXInputHeldActions() {
@@ -767,6 +769,7 @@ XInputHeldActions ReadXInputHeldActions() {
     if (g_xinputGetState == nullptr) {
         g_connectedControllerCount.store(0, std::memory_order_release);
         g_connectedControllerMask.store(0, std::memory_order_release);
+        g_gatherButtonHeldMask.store(0, std::memory_order_release);
         return held;
     }
 
@@ -809,6 +812,7 @@ XInputHeldActions ReadXInputHeldActions() {
                                   gatherController == static_cast<int>(userIndex)) &&
             (pad.wButtons & gatherButton) != 0) {
             held.pickupButton = true;
+            held.gatherButtonMask |= 1u << userIndex;
         }
     }
     const DWORD connectedCount = static_cast<DWORD>(
@@ -820,6 +824,7 @@ XInputHeldActions ReadXInputHeldActions() {
     }
     g_connectedControllerCount.store(connectedCount, std::memory_order_release);
     g_connectedControllerMask.store(connectedMask, std::memory_order_release);
+    g_gatherButtonHeldMask.store(held.gatherButtonMask, std::memory_order_release);
     return held;
 }
 
@@ -1534,6 +1539,10 @@ void CopyDiagnostics(HWND owner) {
     wchar_t maskText[16]{};
     swprintf_s(maskText, L"%lX", static_cast<unsigned long>(controllerMask));
     report += maskText;
+    report += L"; gather button held slots=0x";
+    const DWORD gatherButtonHeldMask = g_gatherButtonHeldMask.load(std::memory_order_acquire);
+    swprintf_s(maskText, L"%lX", static_cast<unsigned long>(gatherButtonHeldMask));
+    report += maskText;
     report += L"; gather button=";
     report += gatherButton;
     const int selectedController = g_gatherControllerIndex.load(std::memory_order_acquire);
@@ -1712,7 +1721,7 @@ void DrawMainWindow(HDC dc, const RECT& client) {
                    static_cast<unsigned long>(controllerCount));
     DrawUiText(dc, controllerText, controllerState,
                 controllerCount > 0 ? kUiGreen : kUiText, g_uiPaintBoldFont);
-    RECT controllerDetail{middle + 26, 303, client.right - 42, 326};
+    RECT controllerDetail{middle + 26, 298, client.right - 42, 316};
     wchar_t gatherDetail[128]{};
     const WORD gatherButtonMask = g_controllerGatherButton.load(std::memory_order_acquire);
     const wchar_t* gatherButton = gatherButtonMask == XINPUT_GAMEPAD_A ? L"A" :
@@ -1725,7 +1734,38 @@ void DrawMainWindow(HDC dc, const RECT& client) {
                    (selectedController == 0 ? L"mando 1" : selectedController == 1 ? L"mando 2" :
                     selectedController == 2 ? L"mando 3" : L"mando 4"),
                static_cast<unsigned long>(timing.gatherIntervalMs));
-    DrawUiText(dc, gatherDetail, controllerDetail, kUiMuted, g_uiPaintFont);
+    DrawUiText(dc, gatherDetail, controllerDetail, kUiMuted, g_uiPaintFont,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT gatherButtonStatus{middle + 26, 317, client.right - 42, 335};
+    const DWORD selectedSlotMask = selectedController < 0 ? (1u << XUSER_MAX_COUNT) - 1u
+                                                           : 1u << selectedController;
+    const DWORD connectedMask = g_connectedControllerMask.load(std::memory_order_acquire);
+    const DWORD heldMask = g_gatherButtonHeldMask.load(std::memory_order_acquire) & selectedSlotMask;
+    wchar_t gatherStatusText[96]{};
+    const wchar_t* gatherStatus = L"";
+    COLORREF gatherStatusColor = kUiMuted;
+    if (gatherButtonMask == 0) {
+        gatherStatus = L"Autorecolección desactivada";
+    } else if (g_xinputGetState == nullptr) {
+        gatherStatus = L"XInput no disponible";
+        gatherStatusColor = kUiAmber;
+    } else if (selectedController >= 0 &&
+               (connectedMask & (1u << selectedController)) == 0) {
+        gatherStatus = L"Conecta el mando seleccionado";
+        gatherStatusColor = kUiAmber;
+    } else if (controllerCount == 0) {
+        gatherStatus = L"Conecta un mando XInput";
+        gatherStatusColor = kUiAmber;
+    } else if (heldMask != 0) {
+        gatherStatus = gameFocused ? L"Detectado · recolección activa"
+                                   : L"Detectado · abre el juego";
+        gatherStatusColor = gameFocused ? kUiGreen : kUiAmber;
+    } else {
+        swprintf_s(gatherStatusText, L"Mantén %s para probar", gatherButton);
+        gatherStatus = gatherStatusText;
+    }
+    DrawUiText(dc, gatherStatus, gatherButtonStatus, gatherStatusColor, g_uiPaintFont,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     RECT settingsCard{25, 352, client.right - 25, 433};
     DrawUiCard(dc, settingsCard);

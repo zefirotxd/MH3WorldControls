@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.0-preview.9
+
+### Español
+
+- La ventana muestra si el botón XInput configurado está siendo detectado y si la recolección automática está activa, esperando el foco del juego o necesita conectar el mando seleccionado.
+- El diagnóstico copiable incluye la ranura XInput cuyo botón de recolección está presionado para facilitar los reportes de soporte.
+- Descarga el ZIP de Windows x64, extráelo y ejecuta `MH3WorldControls.exe` antes de abrir OceanTriRecomp. La recolección con mando requiere que Windows lo exponga como XInput.
+- La compilación de Windows x64 se valida en GitHub Actions; esta vista previa todavía requiere validación dentro del juego con distintos mandos y armas.
+
+### English
+
+- Added live controller-button feedback to the dashboard so users can confirm whether the selected XInput gather button is being detected.
+- Added the held controller-slot mask to copied diagnostics to make controller setup reports more actionable.
+- Download the Windows x64 ZIP, extract it, and run `MH3WorldControls.exe` before launching OceanTriRecomp. Controller auto-gather requires Windows to expose the pad as XInput.
+- The Windows x64 build is checked in GitHub Actions; this preview still needs in-game validation with different controllers and weapons.
+
 ## 0.1.0-preview.8
 
 - Fixed shutdown cleanup so the helper never sends Q-up over a physically held Q key.

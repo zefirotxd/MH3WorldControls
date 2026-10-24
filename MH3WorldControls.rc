@@ -1,8 +1,8 @@
 #include <windows.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,0,8
- PRODUCTVERSION 0,1,0,8
+ FILEVERSION 0,1,0,9
+ PRODUCTVERSION 0,1,0,9
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -15,11 +15,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "MH3WorldControls contributors\0"
             VALUE "FileDescription", "Quality-of-life input helper for OceanTriRecomp\0"
-            VALUE "FileVersion", "0.1.0-preview.8\0"
+            VALUE "FileVersion", "0.1.0-preview.9\0"
             VALUE "InternalName", "MH3WorldControls\0"
             VALUE "OriginalFilename", "MH3WorldControls.exe\0"
             VALUE "ProductName", "MH3 World Controls\0"
-            VALUE "ProductVersion", "0.1.0-preview.8\0"
+            VALUE "ProductVersion", "0.1.0-preview.9\0"
         END
     END
     BLOCK "VarFileInfo"

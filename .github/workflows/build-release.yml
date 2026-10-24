@@ -47,16 +47,35 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Download build package
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: MH3WorldControls-Windows-x64
           path: dist
 
+      - name: Extract versioned release notes
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $lines = Get-Content -LiteralPath CHANGELOG.md
+          $heading = "## $version"
+          $start = [Array]::IndexOf($lines, $heading)
+          if ($start -lt 0) { throw "CHANGELOG.md has no section for $version" }
+          $end = $start + 1
+          while ($end -lt $lines.Length -and $lines[$end] -notmatch '^##\s+') { $end++ }
+          $notes = ($lines[$start..($end - 1)] -join "`n").Trim()
+          Set-Content -LiteralPath release-notes.md -Value $notes -Encoding utf8
+
       - name: Publish tagged release
         uses: softprops/action-gh-release@6cbd405e2c4e67a21c47fa9e383d020e4e28b836 # v2.3.3
         with:
           files: dist/MH3WorldControls-Windows-x64.zip
           token: ${{ secrets.GITHUB_TOKEN }}
-          generate_release_notes: true
+          body_path: release-notes.md
+          generate_release_notes: false
           prerelease: ${{ contains(github.ref, '-preview.') }}
